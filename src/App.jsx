@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive,
   BarChart3,
@@ -362,6 +362,243 @@ function formatStatementText(statement, settings) {
   return lines.join('\n');
 }
 
+// --- CSV import/export -------------------------------------------------------
+
+const CLIENT_CSV_COLUMNS = [
+  'Name', 'Email', 'Phone', 'Type', 'Billing Model', 'Session Rate', 'Monthly Fee',
+  'Collection Method', 'Schedule Type', 'Session Day', 'Session Time',
+  'Session Day 2', 'Session Time 2', 'Duration', 'Reminder Preference',
+  'Tags', 'Joining Date', 'Status', 'Notes',
+];
+
+// A marked, self-documenting example row. The importer skips any row whose Name
+// begins with "example", so it can ride along in every export harmlessly.
+const CLIENT_CSV_EXAMPLE = [
+  'EXAMPLE - edit or delete this row', 'jane@example.com', '+91 90000 00000',
+  'Individual', 'Per Session', '2500', '0', 'Pay After Session', 'Recurring',
+  'Tuesday', '10:00', 'Friday', '17:00', '60', 'WhatsApp', 'Student;Scholarship',
+  '2026-01-15', 'Active', 'Sliding scale; prefers mornings.',
+];
+
+const CLIENT_CSV_ENUMS = {
+  type: ['Individual', 'Group', 'Supervision'],
+  billingModel: ['Per Session', 'Subscription', 'Custom'],
+  collectionMethod: ['Pay Before Session', 'Pay After Session', 'Monthly Invoice', 'Advance Deposit'],
+  scheduleType: ['Recurring', 'Manual'],
+  reminder: ['Email', 'WhatsApp', 'Both', 'None'],
+  status: ['Active', 'Archived'],
+  day: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'],
+};
+
+const CSV_HEADER_TO_FIELD = {
+  name: 'name', email: 'email', phone: 'phone', type: 'type', 'billing model': 'billingModel',
+  'session rate': 'sessionRate', 'monthly fee': 'monthlyFee', 'collection method': 'collectionMethod',
+  'schedule type': 'scheduleType', 'session day': 'day', 'session time': 'time',
+  'session day 2': 'day2', 'session time 2': 'time2', duration: 'duration',
+  'reminder preference': 'reminder', tags: 'tags', 'joining date': 'joiningDate',
+  status: 'status', notes: 'notes',
+};
+
+function csvEscape(value) {
+  const text = value == null ? '' : String(value);
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function toCsv(rows) {
+  return rows.map((row) => row.map(csvEscape).join(',')).join('\n');
+}
+
+// RFC-4180-style parser: handles quoted fields, embedded commas/quotes/newlines.
+function parseCsv(text) {
+  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+  for (let i = 0; i < normalized.length; i += 1) {
+    const ch = normalized[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (normalized[i + 1] === '"') { field += '"'; i += 1; } else { inQuotes = false; }
+      } else {
+        field += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ',') {
+      row.push(field);
+      field = '';
+    } else if (ch === '\n') {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = '';
+    } else {
+      field += ch;
+    }
+  }
+  if (field.length > 0 || row.length > 0) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows;
+}
+
+function matchEnum(value, options) {
+  const target = (value || '').trim().toLowerCase();
+  return options.find((option) => option.toLowerCase() === target) || null;
+}
+
+function clientToCsvRow(client) {
+  return [
+    client.name || '', client.email || '', client.phone || '', client.type || '', client.billingModel || '',
+    client.sessionRate ?? '', client.monthlyFee ?? '', client.collectionMethod || '', client.scheduleType || '',
+    client.day || '', client.time || '', client.day2 || '', client.time2 || '', client.duration ?? '', client.reminder || '',
+    (client.tags || []).join(';'), client.joiningDate || '', client.status || '', client.notes || '',
+  ];
+}
+
+function scheduleSummary(client) {
+  const slots = [];
+  if (client.day) slots.push(`${client.day}${client.time ? ` ${client.time}` : ''}`);
+  if (client.day2) slots.push(`${client.day2}${client.time2 ? ` ${client.time2}` : ''}`);
+  const base = client.scheduleType || 'Manual';
+  return slots.length ? `${base} - ${slots.join(', ')}` : base;
+}
+
+// Parse + validate a client CSV into { imported, skipped, error }.
+function importClientsCsv(text, existingClients) {
+  const rows = parseCsv(text).filter((row) => row.some((cell) => (cell || '').trim() !== ''));
+  if (rows.length === 0) return { accepted: [], skipped: [], error: 'The file is empty.' };
+
+  const header = rows[0].map((h) => h.trim().toLowerCase());
+  const fieldByCol = header.map((h) => CSV_HEADER_TO_FIELD[h] || null);
+  const presentFields = new Set(fieldByCol.filter(Boolean));
+  const requiredColumns = [['name', 'Name'], ['phone', 'Phone'], ['type', 'Type'], ['billingModel', 'Billing Model']];
+  const missing = requiredColumns.filter(([field]) => !presentFields.has(field)).map(([, label]) => label);
+  if (missing.length) return { accepted: [], skipped: [], error: `Missing required column(s): ${missing.join(', ')}.` };
+
+  const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+  const timeRe = /^\d{1,2}:\d{2}$/;
+  const normName = (s) => (s || '').trim().toLowerCase();
+  const normPhone = (s) => (s || '').replace(/\D/g, '');
+  const seen = new Set(existingClients.map((c) => `${normName(c.name)}|${normPhone(c.phone)}`));
+
+  const accepted = [];
+  const skipped = [];
+
+  for (let r = 1; r < rows.length; r += 1) {
+    const raw = rows[r];
+    const get = (field) => {
+      const idx = fieldByCol.indexOf(field);
+      return idx >= 0 ? (raw[idx] ?? '').trim() : '';
+    };
+    const name = get('name');
+    if (name.toLowerCase().startsWith('example')) continue; // skip the template row
+
+    const rowNum = r + 1;
+    const reject = (reason) => skipped.push({ row: rowNum, name: name || '(blank)', reason });
+
+    if (!name) { reject('missing Name'); continue; }
+    const phone = get('phone');
+    if (!phone) { reject('missing Phone'); continue; }
+    const type = matchEnum(get('type'), CLIENT_CSV_ENUMS.type);
+    if (!type) { reject(`invalid Type "${get('type')}"`); continue; }
+    const billingModel = matchEnum(get('billingModel'), CLIENT_CSV_ENUMS.billingModel);
+    if (!billingModel) { reject(`invalid Billing Model "${get('billingModel')}"`); continue; }
+
+    const rateStr = get('sessionRate');
+    const feeStr = get('monthlyFee');
+    const rate = rateStr === '' ? null : Number(rateStr);
+    const fee = feeStr === '' ? null : Number(feeStr);
+    if (rate !== null && Number.isNaN(rate)) { reject(`Session Rate "${rateStr}" is not a number`); continue; }
+    if (fee !== null && Number.isNaN(fee)) { reject(`Monthly Fee "${feeStr}" is not a number`); continue; }
+    if (billingModel === 'Per Session' && rate === null) { reject('Session Rate is required for Per Session'); continue; }
+    if (billingModel === 'Subscription' && fee === null) { reject('Monthly Fee is required for Subscription'); continue; }
+    if (billingModel === 'Custom' && rate === null && fee === null) { reject('Custom needs a Session Rate or Monthly Fee'); continue; }
+
+    let collectionMethod = 'Pay After Session';
+    if (get('collectionMethod')) {
+      const m = matchEnum(get('collectionMethod'), CLIENT_CSV_ENUMS.collectionMethod);
+      if (!m) { reject(`invalid Collection Method "${get('collectionMethod')}"`); continue; }
+      collectionMethod = m;
+    }
+    let scheduleType = 'Manual';
+    if (get('scheduleType')) {
+      const m = matchEnum(get('scheduleType'), CLIENT_CSV_ENUMS.scheduleType);
+      if (!m) { reject(`invalid Schedule Type "${get('scheduleType')}"`); continue; }
+      scheduleType = m;
+    }
+    let day = '';
+    if (get('day')) {
+      const m = matchEnum(get('day'), CLIENT_CSV_ENUMS.day);
+      if (!m) { reject(`invalid Session Day "${get('day')}"`); continue; }
+      day = m;
+    }
+    let day2 = '';
+    if (get('day2')) {
+      const m = matchEnum(get('day2'), CLIENT_CSV_ENUMS.day);
+      if (!m) { reject(`invalid Session Day 2 "${get('day2')}"`); continue; }
+      day2 = m;
+    }
+    const time = get('time');
+    if (time && !timeRe.test(time)) { reject(`invalid Session Time "${time}" (use HH:MM)`); continue; }
+    const time2 = get('time2');
+    if (time2 && !timeRe.test(time2)) { reject(`invalid Session Time 2 "${time2}" (use HH:MM)`); continue; }
+
+    let duration = 60;
+    if (get('duration')) {
+      const d = Number(get('duration'));
+      if (Number.isNaN(d) || d <= 0) { reject(`invalid Duration "${get('duration')}"`); continue; }
+      duration = d;
+    }
+    let reminder = 'None';
+    if (get('reminder')) {
+      const m = matchEnum(get('reminder'), CLIENT_CSV_ENUMS.reminder);
+      if (!m) { reject(`invalid Reminder Preference "${get('reminder')}"`); continue; }
+      reminder = m;
+    }
+    let status = 'Active';
+    if (get('status')) {
+      const m = matchEnum(get('status'), CLIENT_CSV_ENUMS.status);
+      if (!m) { reject(`invalid Status "${get('status')}"`); continue; }
+      status = m;
+    }
+    const joiningDate = get('joiningDate');
+    if (joiningDate && !dateRe.test(joiningDate)) { reject(`invalid Joining Date "${joiningDate}" (use YYYY-MM-DD)`); continue; }
+
+    const key = `${normName(name)}|${normPhone(phone)}`;
+    if (seen.has(key)) { skipped.push({ row: rowNum, name, reason: 'duplicate (Name + Phone)' }); continue; }
+    seen.add(key);
+
+    accepted.push({
+      id: `c${Date.now()}${accepted.length}`,
+      name,
+      email: get('email'),
+      phone,
+      type,
+      billingModel,
+      sessionRate: rate ?? 0,
+      monthlyFee: fee ?? 0,
+      collectionMethod,
+      scheduleType,
+      day,
+      time,
+      day2,
+      time2,
+      duration,
+      reminder,
+      tags: get('tags') ? get('tags').split(';').map((t) => t.trim()).filter(Boolean) : [],
+      joiningDate,
+      notes: get('notes'),
+      status,
+      cancellationRule: 'Use Practice Default',
+    });
+  }
+
+  return { accepted, skipped, error: null };
+}
+
 function isInPeriod(date, view) {
   const target = toDate(date);
   const start = toDate(todayIso);
@@ -388,6 +625,7 @@ function App() {
   const [paymentDraft, setPaymentDraft] = useState({ clientId: 'c1', amount: 2500, method: 'UPI', reference: '', notes: '' });
   const [clientDraft, setClientDraft] = useState(emptyClient());
   const [notice, setNotice] = useState('');
+  const [importResult, setImportResult] = useState(null);
 
   const driveData = useMemo(
     () => ({ settings, clients, groups, sessions, charges, payments }),
@@ -584,16 +822,24 @@ function App() {
   }
 
   function exportClientsCsv() {
-    const rows = [
-      ['Name', 'Email', 'Phone', 'Type', 'Billing Model', 'Session Rate', 'Status'],
-      ...clients.map((client) => [client.name, client.email, client.phone, client.type, client.billingModel, client.sessionRate, client.status]),
-    ];
-    downloadFile('quietadmin-clients.csv', rows.map((row) => row.join(',')).join('\n'), 'text/csv');
+    const rows = [CLIENT_CSV_COLUMNS, CLIENT_CSV_EXAMPLE, ...clients.map(clientToCsvRow)];
+    downloadFile('quietadmin-clients.csv', toCsv(rows), 'text/csv');
+  }
+
+  function importCsv(text) {
+    const { accepted, skipped, error } = importClientsCsv(text, clients);
+    if (!error && accepted.length) {
+      setClients((current) => [...current, ...accepted]);
+      setSelectedClientId(accepted[0].id);
+      showNotice(`Imported ${accepted.length} client${accepted.length === 1 ? '' : 's'}.`);
+    }
+    setImportResult({ imported: accepted.length, skipped, error });
   }
 
   return (
     <main className={`${themeClass[settings.theme]} min-h-screen bg-[var(--bg)] text-[var(--text)]`}>
       {!settings.onboarded && <Onboarding onComplete={completeOnboarding} onSkip={skipOnboarding} drive={drive} />}
+      {importResult && <ImportSummary result={importResult} onClose={() => setImportResult(null)} />}
       <div className="flex min-h-screen">
         <aside className="hidden w-72 shrink-0 border-r border-[var(--line)] bg-[var(--panel)] px-5 py-6 lg:block">
           <Brand />
@@ -667,6 +913,7 @@ function App() {
                 addClient={addClient}
                 exportClientsCsv={exportClientsCsv}
                 exportJson={exportJson}
+                importCsv={importCsv}
               />
             )}
 
@@ -782,6 +1029,56 @@ function Onboarding({ onComplete, onSkip, drive }) {
             </button>
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function ImportSummary({ result, onClose }) {
+  const { imported, skipped, error } = result;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+      <div className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-lg border border-[var(--line)] bg-[var(--panel)] p-5 shadow-soft">
+        <h2 className="text-xl font-semibold">{error ? 'Import failed' : 'Import complete'}</h2>
+        {error ? (
+          <p className="mt-2 text-sm text-[var(--accent)]">{error}</p>
+        ) : (
+          <>
+            <p className="mt-2 text-sm">
+              Imported <span className="font-semibold">{imported}</span> client{imported === 1 ? '' : 's'}
+              {skipped.length > 0 ? `, skipped ${skipped.length}.` : '.'}
+            </p>
+            {skipped.length > 0 && (
+              <div className="mt-3 overflow-hidden rounded-md border border-[var(--line)]">
+                <table className="w-full text-left text-sm">
+                  <thead className="bg-[var(--panel-muted)] text-xs uppercase text-[var(--subtle)]">
+                    <tr>
+                      <th className="px-3 py-2">Row</th>
+                      <th className="px-3 py-2">Name</th>
+                      <th className="px-3 py-2">Reason</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[var(--line)]">
+                    {skipped.map((item, index) => (
+                      <tr key={`${item.row}-${index}`}>
+                        <td className="px-3 py-2 text-[var(--subtle)]">{item.row}</td>
+                        <td className="px-3 py-2">{item.name}</td>
+                        <td className="px-3 py-2 text-[var(--subtle)]">{item.reason}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
+        )}
+        <button
+          type="button"
+          className="mt-4 icon-button justify-center bg-[var(--primary)] text-white hover:bg-[var(--primary-dark)]"
+          onClick={onClose}
+        >
+          Done
+        </button>
       </div>
     </div>
   );
@@ -975,7 +1272,18 @@ function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient,
   );
 }
 
-function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessions, charges, payments, clientTab, setClientTab, clientDraft, setClientDraft, addClient, exportClientsCsv, exportJson }) {
+function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessions, charges, payments, clientTab, setClientTab, clientDraft, setClientDraft, addClient, exportClientsCsv, exportJson, importCsv }) {
+  const fileInputRef = useRef(null);
+
+  function handleFile(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => importCsv(String(reader.result || ''));
+    reader.readAsText(file);
+    event.target.value = ''; // allow re-importing the same file
+  }
+
   const selectedSessions = selectedClient ? sessions.filter((session) => session.clientId === selectedClient.id) : [];
   const selectedCharges = selectedClient ? charges.filter((charge) => charge.clientId === selectedClient.id) : [];
   const selectedPayments = selectedClient ? payments.filter((payment) => payment.clientId === selectedClient.id) : [];
@@ -995,7 +1303,8 @@ function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessio
             <p className="section-subtitle">Active, archived, billing and cancellation rules.</p>
           </div>
           <div className="flex flex-wrap gap-2">
-            <button className="icon-button" type="button">
+            <input ref={fileInputRef} type="file" accept=".csv,text/csv" className="hidden" onChange={handleFile} />
+            <button className="icon-button" type="button" onClick={() => fileInputRef.current?.click()}>
               <Import size={17} />
               Import CSV
             </button>
@@ -1065,7 +1374,8 @@ function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessio
               <MiniMetric label="Credit Balance" value={currency.format(ledger.credit)} />
               <MiniMetric label="Attendance Rate" value={`${attendanceFor(selectedSessions)}%`} />
               <MiniMetric label="Reminder Preference" value={selectedClient.reminder} />
-              <InfoBlock title="Scheduling" text={`${selectedClient.scheduleType}${selectedClient.day ? ` - ${selectedClient.day} ${selectedClient.time}` : ''}`} />
+              <MiniMetric label="Joining Date" value={selectedClient.joiningDate || '—'} />
+              <InfoBlock title="Scheduling" text={scheduleSummary(selectedClient)} />
               <InfoBlock title="Cancellation Rule" text={selectedClient.cancellationRule} />
               <InfoBlock title="Notes" text={selectedClient.notes || 'No notes yet.'} wide />
             </div>
@@ -1498,9 +1808,12 @@ function emptyClient() {
     scheduleType: 'Manual',
     day: '',
     time: '',
+    day2: '',
+    time2: '',
     duration: 60,
     reminder: 'WhatsApp',
     tags: '',
+    joiningDate: '',
     notes: '',
     status: 'Active',
     cancellationRule: 'Use Practice Default',
