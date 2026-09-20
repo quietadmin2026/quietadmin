@@ -24,6 +24,8 @@ import {
   Cloud,
   CloudOff,
   LogOut,
+  FileText,
+  Copy,
 } from 'lucide-react';
 import { useGoogleDrive } from './googleDrive.js';
 
@@ -40,6 +42,7 @@ const todayIso = '2026-06-10';
 const initialSettings = {
   therapistName: 'Arushi',
   practiceName: 'Quiet Room Therapy',
+  paymentDetails: 'UPI: arushi@okicici',
   autoCreateCharges: true,
   lateCancellationHours: 24,
   lateCancellationCharge: 100,
@@ -189,6 +192,7 @@ const navItems = [
   ['Clients', Users],
   ['Groups', FolderOpen],
   ['Payments', CreditCard],
+  ['Statements', FileText],
   ['Reports', BarChart3],
   ['Settings', Settings],
 ];
@@ -240,6 +244,114 @@ function toDate(value) {
 
 function formatDate(value, options = { day: '2-digit', month: 'short' }) {
   return toDate(value).toLocaleDateString('en-IN', options);
+}
+
+function monthKey(dateStr) {
+  return dateStr.slice(0, 7);
+}
+
+function monthLabel(period) {
+  const [year, month] = period.split('-').map(Number);
+  return new Date(year, month - 1, 1).toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
+}
+
+function endOfMonthIso(period) {
+  const [year, month] = period.split('-').map(Number);
+  const last = new Date(year, month, 0).getDate();
+  return `${period}-${String(last).padStart(2, '0')}`;
+}
+
+function recentMonths(count, fromIso) {
+  const [year, month] = fromIso.slice(0, 7).split('-').map(Number);
+  const out = [];
+  for (let i = 0; i < count; i += 1) {
+    const d = new Date(year, month - 1 - i, 1);
+    out.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
+  }
+  return out;
+}
+
+// Read-only monthly statement for one client: session counts from the schedule,
+// money from the ledger (charges/payments), so it always matches Outstanding.
+function computeMonthlyStatement(client, period, sessions, charges, payments) {
+  const inMonth = (dateStr) => monthKey(dateStr) === period;
+  const start = `${period}-01`;
+  const eom = endOfMonthIso(period);
+
+  const clientSessions = sessions.filter((s) => s.clientId === client.id);
+  const attended = clientSessions.filter((s) => s.status === 'Present' && inMonth(s.date)).length;
+  const lateCancels = clientSessions.filter((s) => s.status === 'Late Cancel' && inMonth(s.date)).length;
+  const cancellations = clientSessions.filter((s) => s.status === 'Cancelled' && inMonth(s.date)).length;
+
+  const clientCharges = charges.filter((c) => c.clientId === client.id);
+  const clientPayments = payments.filter((p) => p.clientId === client.id);
+  const monthCharges = clientCharges.filter((c) => inMonth(c.date));
+  const monthPayments = clientPayments.filter((p) => inMonth(p.date));
+  const sumReason = (list, reason) => list.filter((c) => c.reason === reason).reduce((sum, c) => sum + c.amount, 0);
+
+  const sessionFees = sumReason(monthCharges, 'Session Fee');
+  const lateFees = sumReason(monthCharges, 'Late Cancellation');
+  const otherCharges = monthCharges
+    .filter((c) => c.reason !== 'Session Fee' && c.reason !== 'Late Cancellation')
+    .reduce((sum, c) => sum + c.amount, 0);
+  const chargesTotal = monthCharges.reduce((sum, c) => sum + c.amount, 0);
+  const paymentsTotal = monthPayments.reduce((sum, p) => sum + p.amount, 0);
+
+  const chargesBefore = clientCharges.filter((c) => c.date < start).reduce((sum, c) => sum + c.amount, 0);
+  const paymentsBefore = clientPayments.filter((p) => p.date < start).reduce((sum, p) => sum + p.amount, 0);
+  const broughtForward = chargesBefore - paymentsBefore;
+
+  const chargesToDate = clientCharges.filter((c) => c.date <= eom).reduce((sum, c) => sum + c.amount, 0);
+  const paymentsToDate = clientPayments.filter((p) => p.date <= eom).reduce((sum, p) => sum + p.amount, 0);
+  const net = chargesToDate - paymentsToDate;
+
+  return {
+    clientId: client.id,
+    clientName: client.name,
+    reminder: client.reminder,
+    period,
+    attended,
+    lateCancels,
+    cancellations,
+    sessionFees,
+    lateFees,
+    otherCharges,
+    chargesTotal,
+    paymentsTotal,
+    broughtForward,
+    outstanding: Math.max(net, 0),
+    credit: Math.max(-net, 0),
+    hasActivity: Boolean(attended || lateCancels || cancellations || monthCharges.length || monthPayments.length),
+  };
+}
+
+function formatStatementText(statement, settings) {
+  const money = (n) => currency.format(n);
+  const label = monthLabel(statement.period);
+  const lines = [
+    `${settings.practiceName} — Statement for ${label}`,
+    '',
+    `Hi ${statement.clientName},`,
+    `Here is your summary for ${label}:`,
+    `- Sessions attended: ${statement.attended} (${money(statement.sessionFees)})`,
+  ];
+  if (statement.lateCancels) lines.push(`- Late cancellations: ${statement.lateCancels} (${money(statement.lateFees)})`);
+  if (statement.cancellations) lines.push(`- Cancellations: ${statement.cancellations}`);
+  if (statement.otherCharges) lines.push(`- Other charges: ${money(statement.otherCharges)}`);
+  lines.push(`- Payments received: ${money(statement.paymentsTotal)}`);
+  if (statement.broughtForward > 0) lines.push(`- Brought forward: ${money(statement.broughtForward)}`);
+  if (statement.broughtForward < 0) lines.push(`- Credit brought forward: ${money(-statement.broughtForward)}`);
+  lines.push('');
+  if (statement.outstanding > 0) {
+    lines.push(`Outstanding: ${money(statement.outstanding)}`);
+    if (settings.paymentDetails) lines.push(`Pay via ${settings.paymentDetails}`);
+  } else if (statement.credit > 0) {
+    lines.push(`Credit balance: ${money(statement.credit)}`);
+  } else {
+    lines.push('Balance settled — thank you!');
+  }
+  lines.push('', `— ${settings.therapistName}`);
+  return lines.join('\n');
 }
 
 function isInPeriod(date, view) {
@@ -533,6 +645,17 @@ function App() {
                 paymentDraft={paymentDraft}
                 setPaymentDraft={setPaymentDraft}
                 recordPayment={recordPayment}
+              />
+            )}
+
+            {activeNav === 'Statements' && (
+              <Statements
+                clients={clients}
+                sessions={sessions}
+                charges={charges}
+                payments={payments}
+                settings={settings}
+                showNotice={showNotice}
               />
             )}
 
@@ -940,6 +1063,132 @@ function Payments({ clients, ledgers, payments, paymentDraft, setPaymentDraft, r
   );
 }
 
+function Statements({ clients, sessions, charges, payments, settings, showNotice }) {
+  const months = useMemo(() => recentMonths(6, todayIso), []);
+  const [period, setPeriod] = useState(months[0]);
+  const [showEmpty, setShowEmpty] = useState(false);
+
+  const activeClients = useMemo(() => clients.filter((client) => client.status === 'Active'), [clients]);
+  const statements = useMemo(
+    () => activeClients.map((client) => computeMonthlyStatement(client, period, sessions, charges, payments)),
+    [activeClients, period, sessions, charges, payments],
+  );
+  const visible = showEmpty ? statements : statements.filter((statement) => statement.hasActivity);
+
+  const totals = statements.reduce(
+    (acc, statement) => ({
+      billed: acc.billed + statement.chargesTotal,
+      collected: acc.collected + statement.paymentsTotal,
+      outstanding: acc.outstanding + statement.outstanding,
+      active: acc.active + (statement.hasActivity ? 1 : 0),
+    }),
+    { billed: 0, collected: 0, outstanding: 0, active: 0 },
+  );
+
+  function copyStatement(statement) {
+    const text = formatStatementText(statement, settings);
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(
+        () => showNotice(`${statement.clientName}'s statement copied.`),
+        () => showNotice('Could not copy — check browser permissions.'),
+      );
+    } else {
+      showNotice('Clipboard not available in this browser.');
+    }
+  }
+
+  return (
+    <div className="space-y-5">
+      <Panel>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h3 className="section-title">Monthly Statements</h3>
+            <p className="section-subtitle">
+              Auto-calculated per client. Copy to share on WhatsApp or email — automated sending comes later.
+            </p>
+          </div>
+          <div className="w-full sm:w-56">
+            <Select
+              label="Month"
+              value={period}
+              options={months}
+              labels={Object.fromEntries(months.map((m) => [m, monthLabel(m)]))}
+              onChange={setPeriod}
+            />
+          </div>
+        </div>
+        <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <MiniMetric label="Clients with Activity" value={totals.active} />
+          <MiniMetric label="Revenue Billed" value={currency.format(totals.billed)} />
+          <MiniMetric label="Revenue Collected" value={currency.format(totals.collected)} />
+          <MiniMetric label="Outstanding" value={currency.format(totals.outstanding)} />
+        </div>
+        <label className="mt-4 flex w-fit items-center gap-2 text-sm text-[var(--subtle)]">
+          <input type="checkbox" className="h-4 w-4 accent-[var(--primary)]" checked={showEmpty} onChange={(event) => setShowEmpty(event.target.checked)} />
+          Show clients with no activity this month
+        </label>
+      </Panel>
+
+      {visible.length === 0 ? (
+        <Panel>
+          <p className="text-sm text-[var(--subtle)]">No client activity for {monthLabel(period)}.</p>
+        </Panel>
+      ) : (
+        <div className="grid gap-4 xl:grid-cols-2">
+          {visible.map((statement) => (
+            <StatementCard key={statement.clientId} statement={statement} onCopy={() => copyStatement(statement)} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StatementCard({ statement, onCopy }) {
+  const money = (n) => currency.format(n);
+  const rows = [['Sessions attended', `${statement.attended} · ${money(statement.sessionFees)}`]];
+  if (statement.lateCancels) rows.push(['Late cancellations', `${statement.lateCancels} · ${money(statement.lateFees)}`]);
+  if (statement.cancellations) rows.push(['Cancellations', `${statement.cancellations}`]);
+  if (statement.otherCharges) rows.push(['Other charges', money(statement.otherCharges)]);
+  rows.push(['Payments received', money(statement.paymentsTotal)]);
+  if (statement.broughtForward > 0) rows.push(['Brought forward', money(statement.broughtForward)]);
+  if (statement.broughtForward < 0) rows.push(['Credit brought forward', money(-statement.broughtForward)]);
+
+  const closing =
+    statement.outstanding > 0
+      ? ['Outstanding', money(statement.outstanding)]
+      : statement.credit > 0
+        ? ['Credit balance', money(statement.credit)]
+        : ['Balance', 'Settled'];
+
+  return (
+    <Panel>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h4 className="text-lg font-semibold">{statement.clientName}</h4>
+          <p className="text-sm text-[var(--subtle)]">Reminder preference: {statement.reminder || 'None'}</p>
+        </div>
+        <button className="icon-button px-3 py-2 text-xs" type="button" onClick={onCopy}>
+          <Copy size={15} />
+          Copy
+        </button>
+      </div>
+      <div className="mt-4 divide-y divide-[var(--line)] rounded-md border border-[var(--line)]">
+        {rows.map(([label, value]) => (
+          <div key={label} className="flex items-center justify-between px-3 py-2 text-sm">
+            <span className="text-[var(--subtle)]">{label}</span>
+            <span className="font-medium">{value}</span>
+          </div>
+        ))}
+        <div className="flex items-center justify-between bg-[var(--panel-muted)] px-3 py-2.5 text-sm font-semibold">
+          <span>{closing[0]}</span>
+          <span>{closing[1]}</span>
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
 function Reports({ stats, exportJson }) {
   const rows = [
     ['Sessions Scheduled', stats.sessionsScheduled],
@@ -979,6 +1228,7 @@ function SettingsScreen({ settings, setSettings, resetData }) {
         <div className="mt-4 grid gap-3">
           <Input label="Therapist Name" value={settings.therapistName} onChange={(value) => setSettings({ ...settings, therapistName: value })} />
           <Input label="Practice Name" value={settings.practiceName} onChange={(value) => setSettings({ ...settings, practiceName: value })} />
+          <Input label="Payment Details (UPI / bank)" value={settings.paymentDetails || ''} onChange={(value) => setSettings({ ...settings, paymentDetails: value })} />
           <Select label="Theme" value={settings.theme} options={['Quiet Cream', 'Terracotta', 'Sage', 'Slate']} onChange={(value) => setSettings({ ...settings, theme: value })} />
         </div>
         <div className="mt-5 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
