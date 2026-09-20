@@ -399,6 +399,33 @@ function formatStatementText(statement, settings) {
   return lines.join('\n');
 }
 
+// A short, gentle nudge for a client who still owes money — separate from the
+// full monthly statement above.
+function formatReminderText(statement, settings, label) {
+  const lines = [
+    `${settings.practiceName} — payment reminder`,
+    '',
+    `Hi ${statement.clientName},`,
+    `A gentle reminder that ${formatMoney(statement.outstanding)} is outstanding on your account${label ? ` as of ${label}` : ''}.`,
+  ];
+  if (settings.paymentDetails) lines.push(`You can pay via ${settings.paymentDetails}.`);
+  lines.push('Thank you!', '', `— ${settings.therapistName}`);
+  return lines.join('\n');
+}
+
+// Deep links that open a prefilled message for the therapist to review and send
+// — nothing is sent automatically. wa.me needs a country-code number with no
+// punctuation; mailto carries a subject and body.
+function whatsappUrl(phone, text) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  return digits ? `https://wa.me/${digits}?text=${encodeURIComponent(text)}` : '';
+}
+
+function mailtoUrl(email, subject, body) {
+  if (!email) return '';
+  return `mailto:${email}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+}
+
 // --- CSV import/export -------------------------------------------------------
 
 const CLIENT_CSV_COLUMNS = [
@@ -1624,6 +1651,19 @@ function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient,
 
   return (
     <div className="space-y-5">
+      {settings.outstandingReminders && outstandingClients.length > 0 && (
+        <button
+          type="button"
+          onClick={() => setActiveNav('Statements')}
+          className="flex w-full items-center gap-3 rounded-md border border-[var(--line)] bg-[var(--accent-soft)] px-4 py-3 text-left transition hover:brightness-95"
+        >
+          <Mail size={18} className="shrink-0 text-[var(--primary)]" />
+          <span className="text-sm">
+            <span className="font-semibold">{outstandingClients.length} client{outstandingClients.length === 1 ? '' : 's'} with {formatMoney(stats.outstanding)} outstanding.</span>{' '}
+            <span className="text-[var(--subtle)]">Review statements and send reminders →</span>
+          </span>
+        </button>
+      )}
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard title="Today's Sessions" value={stats.today} icon={CalendarDays} />
         <StatCard title="Outstanding Amount" value={formatMoney(stats.outstanding)} icon={WalletCards} />
@@ -2410,15 +2450,43 @@ function Statements({ clients, sessions, charges, payments, settings, showNotice
     { billed: 0, collected: 0, outstanding: 0, active: 0 },
   );
 
-  function copyStatement(statement) {
-    const text = formatStatementText(statement, settings);
+  const clientById = useMemo(() => Object.fromEntries(clients.map((client) => [client.id, client])), [clients]);
+  const periodLabel = monthLabel(period);
+  const owing = visible.filter((statement) => statement.outstanding > 0);
+
+  function copyText(text, doneMessage) {
     if (navigator.clipboard?.writeText) {
       navigator.clipboard.writeText(text).then(
-        () => showNotice(`${statement.clientName}'s statement copied.`),
+        () => showNotice(doneMessage),
         () => showNotice('Could not copy — check browser permissions.'),
       );
     } else {
       showNotice('Clipboard not available in this browser.');
+    }
+  }
+
+  function copyStatement(statement) {
+    copyText(formatStatementText(statement, settings), `${statement.clientName}'s statement copied.`);
+  }
+
+  // jsPDF is loaded on demand so it never weighs down the initial app load.
+  async function downloadPdf(statement) {
+    try {
+      const mod = await import('./statementPdf.js');
+      mod.downloadStatementPdf(statement, settings, periodLabel);
+    } catch {
+      showNotice('Could not build the PDF. Please try again.');
+    }
+  }
+
+  async function downloadAllPdf() {
+    if (visible.length === 0) return;
+    try {
+      const mod = await import('./statementPdf.js');
+      mod.downloadStatementsPdf(visible, settings, periodLabel);
+      showNotice(`Downloaded ${visible.length} statement${visible.length === 1 ? '' : 's'}.`);
+    } catch {
+      showNotice('Could not build the PDF. Please try again.');
     }
   }
 
@@ -2429,17 +2497,28 @@ function Statements({ clients, sessions, charges, payments, settings, showNotice
           <div>
             <h3 className="section-title">Monthly Statements</h3>
             <p className="section-subtitle">
-              Auto-calculated per client. Copy to share on WhatsApp or email — automated sending comes later.
+              Auto-calculated per client. Download a PDF or share a prefilled message on WhatsApp or email.
             </p>
           </div>
-          <div className="w-full sm:w-56">
-            <Select
-              label="Month"
-              value={period}
-              options={months}
-              labels={Object.fromEntries(months.map((m) => [m, monthLabel(m)]))}
-              onChange={setPeriod}
-            />
+          <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:items-end">
+            <button
+              type="button"
+              className="icon-button"
+              onClick={downloadAllPdf}
+              disabled={visible.length === 0}
+            >
+              <Download size={17} />
+              Download all
+            </button>
+            <div className="w-full sm:w-56">
+              <Select
+                label="Month"
+                value={period}
+                options={months}
+                labels={Object.fromEntries(months.map((m) => [m, monthLabel(m)]))}
+                onChange={setPeriod}
+              />
+            </div>
           </div>
         </div>
         <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -2454,6 +2533,33 @@ function Statements({ clients, sessions, charges, payments, settings, showNotice
         </label>
       </Panel>
 
+      {settings.outstandingReminders && owing.length > 0 && (
+        <Panel>
+          <h3 className="section-title">Outstanding reminders</h3>
+          <p className="section-subtitle">{owing.length} client{owing.length === 1 ? '' : 's'} with a balance for {periodLabel}. Send a gentle nudge.</p>
+          <div className="mt-4 space-y-2">
+            {owing.map((statement) => {
+              const client = clientById[statement.clientId];
+              const text = formatReminderText(statement, settings, periodLabel);
+              const subject = `Payment reminder — ${settings.practiceName}`;
+              return (
+                <div key={statement.clientId} className="flex flex-col gap-2 rounded-md border border-[var(--line)] bg-[var(--bg)] p-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <p className="font-semibold">{statement.clientName}</p>
+                    <p className="text-sm text-[var(--subtle)]">Outstanding {formatMoney(statement.outstanding)}</p>
+                  </div>
+                  <ShareActions
+                    waUrl={whatsappUrl(client?.phone, text)}
+                    mailUrl={mailtoUrl(client?.email, subject, text)}
+                    onCopy={() => copyText(text, `${statement.clientName}'s reminder copied.`)}
+                  />
+                </div>
+              );
+            })}
+          </div>
+        </Panel>
+      )}
+
       {visible.length === 0 ? (
         <Panel>
           <p className="text-sm text-[var(--subtle)]">No client activity for {monthLabel(period)}.</p>
@@ -2461,7 +2567,15 @@ function Statements({ clients, sessions, charges, payments, settings, showNotice
       ) : (
         <div className="grid gap-4 xl:grid-cols-2">
           {visible.map((statement) => (
-            <StatementCard key={statement.clientId} statement={statement} onCopy={() => copyStatement(statement)} />
+            <StatementCard
+              key={statement.clientId}
+              statement={statement}
+              client={clientById[statement.clientId]}
+              settings={settings}
+              periodLabel={periodLabel}
+              onCopy={() => copyStatement(statement)}
+              onDownloadPdf={() => downloadPdf(statement)}
+            />
           ))}
         </div>
       )}
@@ -2469,7 +2583,43 @@ function Statements({ clients, sessions, charges, payments, settings, showNotice
   );
 }
 
-function StatementCard({ statement, onCopy }) {
+// Share row reused by statement cards and outstanding reminders. WhatsApp and
+// email are prefilled deep links (the therapist reviews and sends); a channel is
+// disabled when the client has no phone/email for it.
+function ShareActions({ waUrl, mailUrl, onCopy }) {
+  const linkClass = 'icon-button px-3 py-2 text-xs';
+  const disabledClass = 'icon-button px-3 py-2 text-xs pointer-events-none opacity-40';
+  return (
+    <div className="flex flex-wrap gap-2">
+      <a
+        className={waUrl ? linkClass : disabledClass}
+        href={waUrl || undefined}
+        target="_blank"
+        rel="noopener noreferrer"
+        aria-disabled={!waUrl}
+        title={waUrl ? 'Open WhatsApp' : 'No phone number on file'}
+      >
+        <MessageCircle size={15} />
+        WhatsApp
+      </a>
+      <a
+        className={mailUrl ? linkClass : disabledClass}
+        href={mailUrl || undefined}
+        aria-disabled={!mailUrl}
+        title={mailUrl ? 'Open email' : 'No email on file'}
+      >
+        <Mail size={15} />
+        Email
+      </a>
+      <button className="icon-button px-3 py-2 text-xs" type="button" onClick={onCopy}>
+        <Copy size={15} />
+        Copy
+      </button>
+    </div>
+  );
+}
+
+function StatementCard({ statement, client, settings, periodLabel, onCopy, onDownloadPdf }) {
   const money = (n) => formatMoney(n);
   const rows = [['Sessions attended', `${statement.attended} · ${money(statement.sessionFees)}`]];
   if (statement.lateCancels) rows.push(['Late cancellations', `${statement.lateCancels} · ${money(statement.lateFees)}`]);
@@ -2486,6 +2636,9 @@ function StatementCard({ statement, onCopy }) {
         ? ['Credit balance', money(statement.credit)]
         : ['Balance', 'Settled'];
 
+  const shareText = formatStatementText(statement, settings);
+  const subject = `Statement for ${periodLabel} — ${settings.practiceName}`;
+
   return (
     <Panel>
       <div className="flex items-start justify-between gap-3">
@@ -2493,9 +2646,9 @@ function StatementCard({ statement, onCopy }) {
           <h4 className="text-lg font-semibold">{statement.clientName}</h4>
           <p className="text-sm text-[var(--subtle)]">Reminder preference: {statement.reminder || 'None'}</p>
         </div>
-        <button className="icon-button px-3 py-2 text-xs" type="button" onClick={onCopy}>
-          <Copy size={15} />
-          Copy
+        <button className="icon-button px-3 py-2 text-xs" type="button" onClick={onDownloadPdf}>
+          <Download size={15} />
+          PDF
         </button>
       </div>
       <div className="mt-4 divide-y divide-[var(--line)] rounded-md border border-[var(--line)]">
@@ -2509,6 +2662,13 @@ function StatementCard({ statement, onCopy }) {
           <span>{closing[0]}</span>
           <span>{closing[1]}</span>
         </div>
+      </div>
+      <div className="mt-3">
+        <ShareActions
+          waUrl={whatsappUrl(client?.phone, shareText)}
+          mailUrl={mailtoUrl(client?.email, subject, shareText)}
+          onCopy={onCopy}
+        />
       </div>
     </Panel>
   );
