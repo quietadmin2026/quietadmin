@@ -764,6 +764,71 @@ function reconcileRecurringSessions(clients, sessions) {
   return kept.concat(additions);
 }
 
+// Cap how far back a subscription client can be auto-billed on first run, so an
+// old joining date can't suddenly generate years of charges.
+const SUBSCRIPTION_BACKFILL_MONTHS = 12;
+
+// Shift a YYYY-MM period by n months.
+function addMonths(period, n) {
+  const [year, month] = period.split('-').map(Number);
+  const d = new Date(year, month - 1 + n, 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+// Inclusive list of YYYY-MM periods from start through end (empty if start > end).
+function monthsThrough(start, end) {
+  const out = [];
+  for (let cursor = start; cursor <= end && out.length <= 240; cursor = addMonths(cursor, 1)) {
+    out.push(cursor);
+  }
+  return out;
+}
+
+// Materialize a monthly "Subscription Fee" charge for each active subscription
+// client — from their joining month (bounded to a year of back-billing) through
+// the current month. Idempotent: a month is skipped when that client already
+// has a Subscription Fee charge in it (auto OR manual), so it never duplicates
+// and, unlike the session engine, never removes anything — charges are money and
+// may already be paid, so a changed plan or fee just stops future generation and
+// leaves prior charges to be voided by hand. Same array reference when unchanged.
+function reconcileSubscriptionCharges(clients, charges, autoCreate) {
+  if (!autoCreate) return charges;
+  const currentMonth = monthKey(todayIso);
+  const floorMonth = addMonths(currentMonth, -SUBSCRIPTION_BACKFILL_MONTHS);
+
+  const billedMonths = {};
+  for (const charge of charges) {
+    if (charge.reason === 'Subscription Fee') {
+      (billedMonths[charge.clientId] ||= new Set()).add(monthKey(charge.date));
+    }
+  }
+
+  const additions = [];
+  for (const client of clients) {
+    if (client.status !== 'Active' || client.billingModel !== 'Subscription') continue;
+    const fee = Number(client.monthlyFee) || 0;
+    if (fee <= 0) continue;
+    const joinMonth = ISO_DATE.test(client.joiningDate || '') ? monthKey(client.joiningDate) : currentMonth;
+    const start = joinMonth > floorMonth ? joinMonth : floorMonth;
+    if (start > currentMonth) continue; // future joining date — nothing to bill yet
+    for (const period of monthsThrough(start, currentMonth)) {
+      if (billedMonths[client.id]?.has(period)) continue;
+      additions.push({
+        id: `sub-${client.id}-${period}`,
+        clientId: client.id,
+        date: `${period}-01`,
+        amount: fee,
+        reason: 'Subscription Fee',
+        status: 'Pending',
+        auto: true,
+      });
+    }
+  }
+
+  if (additions.length === 0) return charges;
+  return charges.concat(additions);
+}
+
 const CHARGE_STATUS_TONE = {
   Paid: 'border-emerald-300 bg-emerald-50 text-emerald-700',
   'Partially Paid': 'border-amber-300 bg-amber-50 text-amber-700',
@@ -917,6 +982,14 @@ function App() {
   useEffect(() => {
     setSessions((current) => reconcileRecurringSessions(clients, current));
   }, [clients, setSessions]);
+
+  // Auto-bill subscription clients a monthly fee (per-session clients are billed
+  // on attendance instead). Reads the latest charges via the functional update
+  // so it never needs `charges` in its deps and can't loop; reconcile is
+  // idempotent and generation-only, so it never touches existing charges.
+  useEffect(() => {
+    setCharges((current) => reconcileSubscriptionCharges(clients, current, settings.autoCreateCharges));
+  }, [clients, settings.autoCreateCharges, setCharges]);
 
   const ledgers = useMemo(() => {
     return clients.map((client) => {
