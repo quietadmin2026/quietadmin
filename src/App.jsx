@@ -734,6 +734,57 @@ function reconcileRecurringSessions(clients, sessions) {
   return kept.concat(additions);
 }
 
+const CHARGE_STATUS_TONE = {
+  Paid: 'border-emerald-300 bg-emerald-50 text-emerald-700',
+  'Partially Paid': 'border-amber-300 bg-amber-50 text-amber-700',
+  Pending: 'border-[var(--line)] bg-[var(--panel-muted)] text-[var(--subtle)]',
+};
+
+// Apply one client's payments to their charges so every charge shows how much of
+// it is settled. A payment aimed at a specific charge (payment.chargeId) pays
+// that charge first; whatever is left — plus every untargeted payment — settles
+// the oldest open charges first (FIFO). Payments are consumed oldest-first so
+// the result is deterministic and mirrors the order money actually arrived.
+// Returns { byCharge: { [id]: { paid, balance, status } }, credit }.
+function allocateLedger(charges, payments) {
+  const byDateThenId = (a, b) =>
+    a.date === b.date ? String(a.id).localeCompare(String(b.id)) : a.date.localeCompare(b.date);
+  const ordered = charges.slice().sort(byDateThenId);
+  const paid = Object.fromEntries(ordered.map((charge) => [charge.id, 0]));
+  const balanceOf = (charge) => Math.max(charge.amount - paid[charge.id], 0);
+
+  let pool = 0; // money not yet tied to a charge, waiting for FIFO
+  for (const payment of payments.slice().sort(byDateThenId)) {
+    let amount = Math.max(Number(payment.amount) || 0, 0);
+    // A targeted payment settles its own charge first; overflow joins the pool.
+    if (payment.chargeId && paid[payment.chargeId] != null) {
+      const target = ordered.find((charge) => charge.id === payment.chargeId);
+      const applied = Math.min(amount, balanceOf(target));
+      paid[target.id] += applied;
+      amount -= applied;
+    }
+    pool += amount;
+  }
+
+  for (const charge of ordered) {
+    if (pool <= 0) break;
+    const applied = Math.min(pool, balanceOf(charge));
+    paid[charge.id] += applied;
+    pool -= applied;
+  }
+
+  const byCharge = {};
+  for (const charge of ordered) {
+    const settled = paid[charge.id];
+    byCharge[charge.id] = {
+      paid: settled,
+      balance: Math.max(charge.amount - settled, 0),
+      status: settled <= 0 ? 'Pending' : settled >= charge.amount ? 'Paid' : 'Partially Paid',
+    };
+  }
+  return { byCharge, credit: Math.max(pool, 0) };
+}
+
 function App() {
   const [activeNav, setActiveNav] = useState('Dashboard');
   const [view, setView] = useState('Today');
@@ -745,7 +796,7 @@ function App() {
   const [payments, setPayments] = usePersistentState('payments', []);
   const [selectedClientId, setSelectedClientId] = useState('c1');
   const [clientTab, setClientTab] = useState('Overview');
-  const [paymentDraft, setPaymentDraft] = useState({ clientId: 'c1', amount: 2500, method: 'UPI', reference: '', notes: '' });
+  const [paymentDraft, setPaymentDraft] = useState({ clientId: 'c1', amount: 2500, method: 'UPI', reference: '', notes: '', chargeId: '' });
   const [clientDraft, setClientDraft] = useState(emptyClient());
   const [toast, setToast] = useState(null); // { id, message, action }
   const toastTimer = useRef(null);
@@ -805,6 +856,28 @@ function App() {
   }, [charges, clients, payments]);
 
   const ledgerByClient = useMemo(() => Object.fromEntries(ledgers.map((ledger) => [ledger.clientId, ledger])), [ledgers]);
+
+  // Per-charge settlement (paid/balance/status) and each client's still-open
+  // charges, derived from payments so the picture is always consistent with the
+  // ledger totals above and never needs to be written back to storage.
+  const allocation = useMemo(() => {
+    const chargesByClient = {};
+    for (const charge of charges) (chargesByClient[charge.clientId] ||= []).push(charge);
+    const paymentsByClient = {};
+    for (const payment of payments) (paymentsByClient[payment.clientId] ||= []).push(payment);
+
+    const byCharge = {};
+    const openByClient = {};
+    for (const client of clients) {
+      const clientCharges = chargesByClient[client.id] || [];
+      const { byCharge: settled } = allocateLedger(clientCharges, paymentsByClient[client.id] || []);
+      Object.assign(byCharge, settled);
+      openByClient[client.id] = clientCharges
+        .filter((charge) => settled[charge.id]?.balance > 0)
+        .sort((a, b) => a.date.localeCompare(b.date));
+    }
+    return { byCharge, openByClient };
+  }, [clients, charges, payments]);
 
   const visibleSessions = useMemo(
     () => sessions.filter((session) => isInPeriod(session.date, view)).sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`)),
@@ -956,10 +1029,12 @@ function App() {
         method: paymentDraft.method,
         reference: paymentDraft.reference || 'Manual',
         notes: paymentDraft.notes,
+        // Optional target charge; null lets it settle the oldest open charge first.
+        chargeId: paymentDraft.chargeId || null,
       },
     ]);
     showNotice(`Payment recorded for ${client.name}.`);
-    setPaymentDraft({ ...paymentDraft, amount: 2500, reference: '', notes: '' });
+    setPaymentDraft({ ...paymentDraft, amount: 2500, reference: '', notes: '', chargeId: '' });
   }
 
   function addClient(event) {
@@ -1136,6 +1211,7 @@ function App() {
                 sessions={sessions}
                 charges={charges}
                 payments={payments}
+                allocation={allocation}
                 clientTab={clientTab}
                 setClientTab={setClientTab}
                 clientDraft={clientDraft}
@@ -1154,6 +1230,8 @@ function App() {
                 clients={clients}
                 ledgers={ledgerByClient}
                 payments={payments}
+                charges={charges}
+                allocation={allocation}
                 paymentDraft={paymentDraft}
                 setPaymentDraft={setPaymentDraft}
                 recordPayment={recordPayment}
@@ -1761,7 +1839,7 @@ function SessionModal({ session, client, ledger, statusSession, undoSession, res
   );
 }
 
-function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessions, charges, payments, clientTab, setClientTab, clientDraft, setClientDraft, addClient, exportClientsCsv, exportJson, importCsv }) {
+function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessions, charges, payments, allocation, clientTab, setClientTab, clientDraft, setClientDraft, addClient, exportClientsCsv, exportJson, importCsv }) {
   const fileInputRef = useRef(null);
 
   function handleFile(event) {
@@ -1871,11 +1949,41 @@ function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessio
           )}
           {clientTab === 'Sessions' && <SimpleTable headers={['Date', 'Status', 'Charge']} rows={selectedSessions.map((session) => [formatDate(session.date), session.status, session.chargeId ? 'Generated' : '-'])} />}
           {clientTab === 'Financials' && selectedClient && ledger && (
-            <div className="grid gap-3 sm:grid-cols-2">
-              <MiniMetric label="Total Charges" value={formatMoney(ledger.totalCharges)} />
-              <MiniMetric label="Total Payments" value={formatMoney(ledger.totalPayments)} />
-              <MiniMetric label="Outstanding" value={formatMoney(ledger.outstanding)} />
-              <MiniMetric label="Credit Balance" value={formatMoney(ledger.credit)} />
+            <div className="space-y-4">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <MiniMetric label="Total Charges" value={formatMoney(ledger.totalCharges)} />
+                <MiniMetric label="Total Payments" value={formatMoney(ledger.totalPayments)} />
+                <MiniMetric label="Outstanding" value={formatMoney(ledger.outstanding)} />
+                <MiniMetric label="Credit Balance" value={formatMoney(ledger.credit)} />
+              </div>
+              <div>
+                <p className="mb-2 text-sm font-semibold">Charges</p>
+                {selectedCharges.length === 0 ? (
+                  <p className="text-sm text-[var(--subtle)]">No charges for this client yet.</p>
+                ) : (
+                  <SimpleTable
+                    headers={['Date', 'Reason', 'Amount', 'Paid', 'Balance', 'Status']}
+                    rows={selectedCharges
+                      .slice()
+                      .sort((a, b) => b.date.localeCompare(a.date))
+                      .map((charge) => {
+                        const settled = allocation?.byCharge[charge.id] || {
+                          paid: 0,
+                          balance: charge.amount,
+                          status: 'Pending',
+                        };
+                        return [
+                          formatDate(charge.date),
+                          charge.reason,
+                          formatMoney(charge.amount),
+                          formatMoney(settled.paid),
+                          formatMoney(settled.balance),
+                          <ChargeStatusBadge key="s" status={settled.status} />,
+                        ];
+                      })}
+                  />
+                )}
+              </div>
             </div>
           )}
           {clientTab === 'Timeline' && (
@@ -1925,15 +2033,40 @@ function Groups({ groups, clients }) {
   );
 }
 
-function Payments({ clients, ledgers, payments, paymentDraft, setPaymentDraft, recordPayment }) {
+function Payments({ clients, ledgers, payments, charges, allocation, paymentDraft, setPaymentDraft, recordPayment }) {
+  const openCharges = allocation?.openByClient[paymentDraft.clientId] || [];
+  const applyOptions = ['', ...openCharges.map((charge) => charge.id)];
+  const applyLabels = {
+    '': 'Oldest unpaid first',
+    ...Object.fromEntries(
+      openCharges.map((charge) => {
+        const balance = allocation?.byCharge[charge.id]?.balance ?? charge.amount;
+        return [charge.id, `${charge.reason} — ${formatMoney(balance)} (${formatDate(charge.date)})`];
+      }),
+    ),
+  };
+
   return (
     <div className="grid gap-5 xl:grid-cols-[0.8fr_1.2fr]">
       <Panel>
         <h3 className="section-title">Record Payment</h3>
         <p className="section-subtitle">Supports UPI, bank transfer, cash, card and other methods.</p>
         <form className="mt-4 grid gap-3" onSubmit={recordPayment}>
-          <Select label="Client" value={paymentDraft.clientId} options={clients.map((client) => client.id)} labels={Object.fromEntries(clients.map((client) => [client.id, client.name]))} onChange={(value) => setPaymentDraft({ ...paymentDraft, clientId: value })} />
+          <Select
+            label="Client"
+            value={paymentDraft.clientId}
+            options={clients.map((client) => client.id)}
+            labels={Object.fromEntries(clients.map((client) => [client.id, client.name]))}
+            onChange={(value) => setPaymentDraft({ ...paymentDraft, clientId: value, chargeId: '' })}
+          />
           <Input label="Amount" type="number" value={paymentDraft.amount} onChange={(value) => setPaymentDraft({ ...paymentDraft, amount: value })} />
+          <Select
+            label="Apply to"
+            value={applyOptions.includes(paymentDraft.chargeId) ? paymentDraft.chargeId : ''}
+            options={applyOptions}
+            labels={applyLabels}
+            onChange={(value) => setPaymentDraft({ ...paymentDraft, chargeId: value })}
+          />
           <Select label="Method" value={paymentDraft.method} options={['UPI', 'Bank Transfer', 'Cash', 'Card', 'Other']} onChange={(value) => setPaymentDraft({ ...paymentDraft, method: value })} />
           <Input label="Reference Number" value={paymentDraft.reference} onChange={(value) => setPaymentDraft({ ...paymentDraft, reference: value })} />
           <Input label="Notes" value={paymentDraft.notes} onChange={(value) => setPaymentDraft({ ...paymentDraft, notes: value })} />
@@ -1948,11 +2081,15 @@ function Payments({ clients, ledgers, payments, paymentDraft, setPaymentDraft, r
         <div className="mt-4 space-y-3">
           {payments.slice().reverse().map((payment) => {
             const client = clients.find((item) => item.id === payment.clientId);
+            const target = payment.chargeId
+              ? charges.find((charge) => charge.id === payment.chargeId)
+              : null;
             return (
               <div key={payment.id} className="flex flex-col gap-2 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4 sm:flex-row sm:items-center sm:justify-between">
                 <div>
                   <p className="font-semibold">{client.name}</p>
                   <p className="text-sm text-[var(--subtle)]">{formatDate(payment.date)} - {payment.method} - {payment.reference}</p>
+                  <p className="text-xs text-[var(--subtle)]">{target ? `Applied to ${target.reason}` : 'Oldest unpaid first'}</p>
                 </div>
                 <div className="text-left sm:text-right">
                   <p className="font-semibold">{formatMoney(payment.amount)}</p>
@@ -2343,6 +2480,11 @@ function Segmented({ options, value, onChange, className = '' }) {
 
 function StatusBadge({ status }) {
   return <span className="rounded-md bg-[var(--panel-muted)] px-2 py-1 text-xs font-semibold text-[var(--subtle)]">{status}</span>;
+}
+
+function ChargeStatusBadge({ status }) {
+  const tone = CHARGE_STATUS_TONE[status] || CHARGE_STATUS_TONE.Pending;
+  return <span className={`inline-block rounded-md border px-2 py-1 text-xs font-semibold ${tone}`}>{status}</span>;
 }
 
 function SmallAction({ icon: Icon, label, onClick, active = false }) {
