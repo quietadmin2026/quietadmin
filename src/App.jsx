@@ -243,7 +243,7 @@ const themeClass = {
 };
 
 const STORAGE_PREFIX = 'quietadmin:';
-const STORAGE_KEYS = ['settings', 'clients', 'groups', 'sessions', 'charges', 'payments'];
+const STORAGE_KEYS = ['settings', 'clients', 'groups', 'sessions', 'groupSessions', 'charges', 'payments'];
 
 // Guard against corrupt/legacy data: arrays must stay arrays, settings stays an
 // object (merged over defaults so new fields are never missing). Anything of the
@@ -934,6 +934,7 @@ function App() {
   const [clients, setClients] = usePersistentState('clients', []);
   const [groups, setGroups] = usePersistentState('groups', []);
   const [sessions, setSessions] = usePersistentState('sessions', []);
+  const [groupSessions, setGroupSessions] = usePersistentState('groupSessions', []);
   const [charges, setCharges] = usePersistentState('charges', []);
   const [payments, setPayments] = usePersistentState('payments', []);
   const [selectedClientId, setSelectedClientId] = useState('c1');
@@ -945,8 +946,8 @@ function App() {
   const [importResult, setImportResult] = useState(null);
 
   const driveData = useMemo(
-    () => ({ settings, clients, groups, sessions, charges, payments }),
-    [settings, clients, groups, sessions, charges, payments],
+    () => ({ settings, clients, groups, sessions, groupSessions, charges, payments }),
+    [settings, clients, groups, sessions, groupSessions, charges, payments],
   );
 
   const applyRemote = useCallback((remote) => {
@@ -960,9 +961,10 @@ function App() {
     if (Array.isArray(remote.clients)) setClients(remote.clients);
     if (Array.isArray(remote.groups)) setGroups(remote.groups);
     if (Array.isArray(remote.sessions)) setSessions(remote.sessions);
+    if (Array.isArray(remote.groupSessions)) setGroupSessions(remote.groupSessions);
     if (Array.isArray(remote.charges)) setCharges(remote.charges);
     if (Array.isArray(remote.payments)) setPayments(remote.payments);
-  }, [setSettings, setClients, setGroups, setSessions, setCharges, setPayments]);
+  }, [setSettings, setClients, setGroups, setSessions, setGroupSessions, setCharges, setPayments]);
 
   const drive = useGoogleDrive({ clientId: GOOGLE_CLIENT_ID, data: driveData, applyRemote });
 
@@ -974,6 +976,7 @@ function App() {
   }, []);
 
   const clientById = useMemo(() => Object.fromEntries(clients.map((client) => [client.id, client])), [clients]);
+  const groupById = useMemo(() => Object.fromEntries(groups.map((group) => [group.id, group])), [groups]);
 
   // Keep upcoming sessions materialized from each recurring client's weekly
   // schedule. Runs on mount and whenever clients change (add, edit a day/time,
@@ -1247,6 +1250,90 @@ function App() {
     });
   }
 
+  function addGroup(draft) {
+    if (!String(draft.name || '').trim()) return false;
+    const group = {
+      ...draft,
+      id: `g${Date.now()}`,
+      name: draft.name.trim(),
+      capacity: Number(draft.capacity) || 0,
+      sessionFee: Number(draft.sessionFee) || 0,
+      members: draft.members || [],
+    };
+    setGroups((current) => [...current, group]);
+    showNotice(`${group.name} created.`);
+    return group.id;
+  }
+
+  function updateGroup(next) {
+    setGroups((current) => current.map((group) => (group.id === next.id ? next : group)));
+    showNotice(`${next.name} updated.`);
+  }
+
+  function addGroupSession(draft) {
+    if (!draft.groupId || !draft.date || !draft.time) return false;
+    const group = groupById[draft.groupId];
+    setGroupSessions((current) => [
+      ...current,
+      {
+        id: `gs${Date.now()}`,
+        groupId: draft.groupId,
+        date: draft.date,
+        time: draft.time,
+        duration: Number(draft.duration) || 60,
+        attendance: {},
+      },
+    ]);
+    showNotice(`Group session added for ${group?.name || 'group'}.`);
+    return true;
+  }
+
+  // Remove a group session and any per-member charges it generated.
+  function removeGroupSession(sessionId) {
+    const gs = groupSessions.find((item) => item.id === sessionId);
+    if (!gs) return;
+    const chargeIds = Object.values(gs.attendance || {}).map((entry) => entry.chargeId).filter(Boolean);
+    setGroupSessions((current) => current.filter((item) => item.id !== sessionId));
+    if (chargeIds.length) setCharges((current) => current.filter((charge) => !chargeIds.includes(charge.id)));
+    showNotice('Group session removed.');
+  }
+
+  // Set one member's attendance on a group session. Marking Present bills them
+  // the group's session fee (for Per Session groups, when auto-charges are on);
+  // any other status — or clearing — drops that bill. status null clears the mark.
+  function markGroupAttendance(sessionId, clientId, status) {
+    const gs = groupSessions.find((item) => item.id === sessionId);
+    if (!gs) return;
+    const group = groupById[gs.groupId];
+    const prior = gs.attendance?.[clientId] || {};
+    const bills = settings.autoCreateCharges && group?.billingModel === 'Per Session' && Number(group?.sessionFee) > 0;
+
+    let newChargeId = prior.chargeId || null;
+    let addCharge = null;
+    let removeChargeId = null;
+    if (status === 'Present') {
+      if (bills && !prior.chargeId) {
+        addCharge = { id: `ch${Date.now()}`, clientId, date: gs.date, amount: Number(group.sessionFee), reason: 'Group Session', status: 'Pending' };
+        newChargeId = addCharge.id;
+      }
+    } else if (prior.chargeId) {
+      removeChargeId = prior.chargeId;
+      newChargeId = null;
+    }
+
+    setGroupSessions((current) =>
+      current.map((item) => {
+        if (item.id !== sessionId) return item;
+        const attendance = { ...(item.attendance || {}) };
+        if (status) attendance[clientId] = { status, chargeId: newChargeId };
+        else delete attendance[clientId];
+        return { ...item, attendance };
+      }),
+    );
+    if (addCharge) setCharges((current) => [...current, addCharge]);
+    if (removeChargeId) setCharges((current) => current.filter((charge) => charge.id !== removeChargeId));
+  }
+
   function completeSetup({ therapistName, practiceName, paymentDetails, currency, loadSample }) {
     setSettings((prev) => ({
       ...prev,
@@ -1260,6 +1347,7 @@ function App() {
       setClients(SAMPLE_CLIENTS);
       setGroups(SAMPLE_GROUPS);
       setSessions(SAMPLE_SESSIONS);
+      setGroupSessions([]);
       setCharges(SAMPLE_CHARGES);
       setPayments(SAMPLE_PAYMENTS);
       setSelectedClientId(SAMPLE_CLIENTS[0].id);
@@ -1285,6 +1373,7 @@ function App() {
     setClients(SAMPLE_CLIENTS);
     setGroups(SAMPLE_GROUPS);
     setSessions(SAMPLE_SESSIONS);
+    setGroupSessions([]);
     setCharges(SAMPLE_CHARGES);
     setPayments(SAMPLE_PAYMENTS);
     setSelectedClientId(SAMPLE_CLIENTS[0].id);
@@ -1292,7 +1381,7 @@ function App() {
   }
 
   function exportJson() {
-    const payload = { clients, groups, sessions, charges, payments, settings };
+    const payload = { clients, groups, sessions, groupSessions, charges, payments, settings };
     downloadFile('quietadmin-backup.json', JSON.stringify(payload, null, 2), 'application/json');
   }
 
@@ -1351,7 +1440,7 @@ function App() {
           </nav>
           <div className="mt-8 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
             <p className="text-xs font-semibold uppercase tracking-wide text-[var(--subtle)]">Google Drive shape</p>
-            {['clients.json', 'groups.json', 'sessions.json', 'charges.json', 'payments.json', 'settings.json'].map((file) => (
+            {['clients.json', 'groups.json', 'sessions.json', 'groupsessions.json', 'charges.json', 'payments.json', 'settings.json'].map((file) => (
               <div key={file} className="mt-2 flex items-center gap-2 text-sm text-[var(--subtle)]">
                 <FileJson size={15} />
                 {file}
@@ -1427,7 +1516,20 @@ function App() {
               />
             )}
 
-            {activeNav === 'Groups' && <Groups groups={groups} clients={clientById} />}
+            {activeNav === 'Groups' && (
+              <Groups
+                groups={groups}
+                clients={clientById}
+                clientList={clients}
+                groupSessions={groupSessions}
+                settings={settings}
+                addGroup={addGroup}
+                updateGroup={updateGroup}
+                addGroupSession={addGroupSession}
+                removeGroupSession={removeGroupSession}
+                markGroupAttendance={markGroupAttendance}
+              />
+            )}
 
             {activeNav === 'Payments' && (
               <Payments
@@ -2402,30 +2504,284 @@ function ChargeEditModal({ charge, onSave, onClose }) {
   );
 }
 
-function Groups({ groups, clients }) {
+function emptyGroup() {
+  return { name: '', type: 'Therapy', capacity: 8, billingModel: 'Per Session', sessionFee: 1200, schedule: '', status: 'Active', notes: '', members: [] };
+}
+
+function GroupSessionCard({ session, group, clients, onMark, onRemove }) {
+  const members = group.members || [];
+  const presentCount = members.filter((id) => session.attendance?.[id]?.status === 'Present').length;
   return (
-    <div className="grid gap-5 lg:grid-cols-2">
-      {groups.map((group) => (
-        <Panel key={group.id}>
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <h3 className="text-xl font-semibold">{group.name}</h3>
-              <p className="text-sm text-[var(--subtle)]">{group.type} - {group.status}</p>
+    <div className="rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <p className="font-semibold">{formatDate(session.date, { weekday: 'short', day: '2-digit', month: 'short' })} · {session.time}</p>
+          <p className="text-sm text-[var(--subtle)]">{session.duration || 60} min · {presentCount}/{members.length} present</p>
+        </div>
+        <button
+          type="button"
+          className="rounded-md p-1.5 text-[var(--subtle)] hover:bg-[var(--panel-muted)] hover:text-[var(--accent)]"
+          onClick={() => { if (window.confirm('Remove this group session and any charges it created?')) onRemove(session.id); }}
+          title="Remove session"
+          aria-label="Remove session"
+        >
+          <Trash2 size={15} />
+        </button>
+      </div>
+      <div className="mt-3 space-y-2">
+        {members.length === 0 && <p className="text-sm text-[var(--subtle)]">No members in this group yet — add some from Edit.</p>}
+        {members.map((id) => {
+          const client = clients[id];
+          if (!client) return null;
+          const status = session.attendance?.[id]?.status;
+          return (
+            <div key={id} className="flex flex-col gap-2 rounded-md border border-[var(--line)] bg-[var(--panel)] p-2 sm:flex-row sm:items-center sm:justify-between">
+              <span className="flex items-center gap-2 text-sm font-medium">
+                {client.name}
+                {status && <StatusBadge status={status} />}
+              </span>
+              <div className="flex flex-wrap gap-1.5">
+                <SmallAction icon={Check} label="Present" active={status === 'Present'} onClick={() => onMark(session.id, id, 'Present')} />
+                <SmallAction icon={Clock3} label="Late Cancel" active={status === 'Late Cancel'} onClick={() => onMark(session.id, id, 'Late Cancel')} />
+                <SmallAction icon={X} label="Absent" active={status === 'Absent'} onClick={() => onMark(session.id, id, 'Absent')} />
+                {status && <SmallAction icon={RefreshCcw} label="Clear" onClick={() => onMark(session.id, id, null)} />}
+              </div>
             </div>
-            <StatusBadge status={`${group.members.length}/${group.capacity}`} />
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function Groups({ groups, clients, clientList, groupSessions, settings, addGroup, updateGroup, addGroupSession, removeGroupSession, markGroupAttendance }) {
+  const [selectedId, setSelectedId] = useState(groups[0]?.id || null);
+  const [editing, setEditing] = useState(null); // a group object, or 'new'
+  const [draft, setDraft] = useState({ date: todayIso, time: '18:00', duration: 90 });
+
+  const selected = groups.find((group) => group.id === selectedId) || groups[0] || null;
+  const sessions = useMemo(
+    () => groupSessions
+      .filter((session) => session.groupId === selected?.id)
+      .sort((a, b) => `${b.date}${b.time}`.localeCompare(`${a.date}${a.time}`)),
+    [groupSessions, selected],
+  );
+
+  function submitSession(event) {
+    event.preventDefault();
+    if (!selected) return;
+    if (addGroupSession({ ...draft, groupId: selected.id })) setDraft({ date: todayIso, time: '18:00', duration: 90 });
+  }
+
+  return (
+    <>
+      <div className="grid gap-5 xl:grid-cols-[0.85fr_1.6fr]">
+        <Panel>
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <h3 className="section-title">Groups</h3>
+              <p className="section-subtitle">Therapy and supervision groups.</p>
+            </div>
+            <button type="button" className="icon-button px-3 py-2 text-xs" onClick={() => setEditing('new')}>
+              <Plus size={15} />
+              New group
+            </button>
           </div>
-          <div className="mt-4 grid gap-3 sm:grid-cols-2">
-            <MiniMetric label="Billing Model" value={group.billingModel} />
-            <MiniMetric label="Session Fee" value={formatMoney(group.sessionFee)} />
-            <InfoBlock title="Schedule" text={group.schedule} wide />
-            <InfoBlock title="Notes" text={group.notes} wide />
-          </div>
-          <h4 className="mt-5 font-semibold">Members</h4>
-          <div className="mt-2 flex flex-wrap gap-2">
-            {group.members.map((id) => <span key={id} className="rounded-md bg-[var(--panel-muted)] px-3 py-2 text-sm">{clients[id]?.name}</span>)}
+          <div className="mt-4 space-y-2">
+            {groups.length === 0 && (
+              <p className="text-sm text-[var(--subtle)]">No groups yet. Create one to schedule sessions and track attendance.</p>
+            )}
+            {groups.map((group) => (
+              <button
+                key={group.id}
+                type="button"
+                onClick={() => setSelectedId(group.id)}
+                className={`w-full rounded-md border p-3 text-left transition ${
+                  selected?.id === group.id ? 'border-[var(--primary)] bg-[var(--accent-soft)]' : 'border-[var(--line)] bg-[var(--bg)] hover:bg-[var(--panel-muted)]'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <span className="font-semibold">{group.name}</span>
+                  <StatusBadge status={`${group.members.length}/${group.capacity}`} />
+                </div>
+                <p className="mt-1 text-sm text-[var(--subtle)]">{group.type} · {group.status}</p>
+              </button>
+            ))}
           </div>
         </Panel>
-      ))}
+
+        <Panel>
+          {!selected ? (
+            <p className="text-sm text-[var(--subtle)]">Select or create a group to manage its sessions.</p>
+          ) : (
+            <>
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h3 className="text-2xl font-semibold">{selected.name}</h3>
+                  <p className="text-sm text-[var(--subtle)]">{selected.type} · {selected.status}</p>
+                </div>
+                <button type="button" className="icon-button px-3 py-2 text-xs" onClick={() => setEditing(selected)}>
+                  <Pencil size={14} />
+                  Edit
+                </button>
+              </div>
+              <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                <MiniMetric label="Billing" value={selected.billingModel} />
+                <MiniMetric label="Session Fee" value={formatMoney(selected.sessionFee)} />
+                <MiniMetric label="Members" value={`${selected.members.length}/${selected.capacity}`} />
+              </div>
+              {(selected.schedule || selected.notes) && (
+                <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                  {selected.schedule && <InfoBlock title="Schedule" text={selected.schedule} />}
+                  {selected.notes && <InfoBlock title="Notes" text={selected.notes} />}
+                </div>
+              )}
+              <div className="mt-3 flex flex-wrap gap-2">
+                {selected.members.map((id) => (
+                  <span key={id} className="rounded-md bg-[var(--panel-muted)] px-3 py-1.5 text-sm">{clients[id]?.name || 'Unknown'}</span>
+                ))}
+              </div>
+
+              <h4 className="mt-6 font-semibold">Sessions</h4>
+              <p className="mt-1 text-sm text-[var(--subtle)]">Marking a member present bills the session fee. Auto charge is {settings.autoCreateCharges ? 'on' : 'off'}.</p>
+              <form onSubmit={submitSession} className="mt-3 grid gap-3 rounded-md border border-[var(--line)] bg-[var(--bg)] p-3 sm:grid-cols-4">
+                <Input label="Date" type="date" value={draft.date} onChange={(value) => setDraft((current) => ({ ...current, date: value }))} />
+                <Input label="Time" type="time" value={draft.time} onChange={(value) => setDraft((current) => ({ ...current, time: value }))} />
+                <Input label="Duration (min)" type="number" value={draft.duration} onChange={(value) => setDraft((current) => ({ ...current, duration: value }))} />
+                <div className="flex items-end">
+                  <button type="submit" className="icon-button w-full justify-center bg-[var(--primary)] text-white hover:bg-[var(--primary-dark)]">
+                    <Plus size={16} />
+                    Add session
+                  </button>
+                </div>
+              </form>
+
+              <div className="mt-4 space-y-3">
+                {sessions.length === 0 && (
+                  <p className="rounded-md border border-dashed border-[var(--line)] bg-[var(--bg)] px-4 py-6 text-center text-sm text-[var(--subtle)]">No sessions yet. Add one above.</p>
+                )}
+                {sessions.map((session) => (
+                  <GroupSessionCard
+                    key={session.id}
+                    session={session}
+                    group={selected}
+                    clients={clients}
+                    onMark={markGroupAttendance}
+                    onRemove={removeGroupSession}
+                  />
+                ))}
+              </div>
+            </>
+          )}
+        </Panel>
+      </div>
+
+      {editing && (
+        <GroupEditModal
+          group={editing === 'new' ? emptyGroup() : editing}
+          clientList={clientList}
+          isNew={editing === 'new'}
+          onSave={(next) => {
+            if (editing === 'new') {
+              const id = addGroup(next);
+              if (id) setSelectedId(id);
+            } else {
+              updateGroup(next);
+            }
+          }}
+          onClose={() => setEditing(null)}
+        />
+      )}
+    </>
+  );
+}
+
+function GroupEditModal({ group, clientList, isNew, onSave, onClose }) {
+  const [draft, setDraft] = useState(() => ({ ...group, members: group.members || [] }));
+  const set = (patch) => setDraft((current) => ({ ...current, ...patch }));
+  const toggleMember = (id) =>
+    setDraft((current) => {
+      const members = current.members || [];
+      return { ...current, members: members.includes(id) ? members.filter((m) => m !== id) : [...members, id] };
+    });
+
+  function submit(event) {
+    event.preventDefault();
+    if (!String(draft.name).trim()) return;
+    onSave({ ...draft, name: String(draft.name).trim(), capacity: Number(draft.capacity) || 0, sessionFee: Number(draft.sessionFee) || 0 });
+    onClose();
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
+      <form
+        className="max-h-[88vh] w-full max-w-2xl overflow-y-auto rounded-lg border border-[var(--line)] bg-[var(--panel)] p-5 shadow-soft"
+        onClick={(event) => event.stopPropagation()}
+        onSubmit={submit}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <h2 className="text-xl font-semibold">{isNew ? 'New group' : `Edit ${group.name}`}</h2>
+          <button type="button" className="rounded-md p-1 text-[var(--subtle)] hover:bg-[var(--panel-muted)]" onClick={onClose} aria-label="Close">
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+          <Input label="Name" value={draft.name} onChange={(value) => set({ name: value })} />
+          <Select label="Status" value={draft.status} options={['Active', 'Archived']} onChange={(value) => set({ status: value })} />
+          <Select label="Type" value={draft.type} options={['Therapy', 'Supervision', 'Support', 'Other']} onChange={(value) => set({ type: value })} />
+          <Input label="Capacity" type="number" value={draft.capacity} onChange={(value) => set({ capacity: value })} />
+          <Select label="Billing Model" value={draft.billingModel} options={['Per Session', 'Subscription']} onChange={(value) => set({ billingModel: value })} />
+          <Input label="Session Fee" type="number" value={draft.sessionFee} onChange={(value) => set({ sessionFee: value })} />
+        </div>
+        <label className="mt-3 block">
+          <span className="text-sm font-medium text-[var(--subtle)]">Schedule (free text)</span>
+          <input
+            value={draft.schedule || ''}
+            onChange={(event) => set({ schedule: event.target.value })}
+            className="mt-1 w-full rounded-md border border-[var(--line)] bg-[var(--panel)] px-3 py-2 text-sm text-[var(--text)]"
+            placeholder="e.g. Every Tuesday, 6:00 PM, 90 minutes"
+          />
+        </label>
+        <label className="mt-3 block">
+          <span className="text-sm font-medium text-[var(--subtle)]">Notes</span>
+          <textarea
+            value={draft.notes || ''}
+            onChange={(event) => set({ notes: event.target.value })}
+            rows={2}
+            className="mt-1 w-full rounded-md border border-[var(--line)] bg-[var(--panel)] px-3 py-2 text-sm text-[var(--text)]"
+          />
+        </label>
+
+        <div className="mt-4">
+          <p className="text-sm font-medium text-[var(--subtle)]">Members</p>
+          {clientList.length === 0 ? (
+            <p className="mt-1 text-sm text-[var(--subtle)]">Add clients first, then you can put them in a group.</p>
+          ) : (
+            <div className="mt-2 grid max-h-48 gap-1 overflow-auto scrollbar-soft rounded-md border border-[var(--line)] bg-[var(--bg)] p-2 sm:grid-cols-2">
+              {clientList.map((client) => (
+                <label key={client.id} className="flex items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-[var(--panel-muted)]">
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 accent-[var(--primary)]"
+                    checked={(draft.members || []).includes(client.id)}
+                    onChange={() => toggleMember(client.id)}
+                  />
+                  {client.name}
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="mt-5 flex justify-end gap-2">
+          <button type="button" className="icon-button" onClick={onClose}>Cancel</button>
+          <button type="submit" className="icon-button bg-[var(--primary)] text-white hover:bg-[var(--primary-dark)]">
+            <Check size={16} />
+            {isNew ? 'Create group' : 'Save changes'}
+          </button>
+        </div>
+      </form>
     </div>
   );
 }

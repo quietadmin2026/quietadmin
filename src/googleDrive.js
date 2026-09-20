@@ -15,6 +15,7 @@ export const FILE_KEYS = [
   ['clients', 'clients.json'],
   ['groups', 'groups.json'],
   ['sessions', 'sessions.json'],
+  ['groupSessions', 'groupsessions.json'],
   ['charges', 'charges.json'],
   ['payments', 'payments.json'],
 ];
@@ -26,6 +27,7 @@ const EXPECTED_SHAPE = {
   clients: 'array',
   groups: 'array',
   sessions: 'array',
+  groupSessions: 'array',
   charges: 'array',
   payments: 'array',
 };
