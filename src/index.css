@@ -92,6 +92,27 @@ textarea:focus-visible {
   border-color: var(--line);
 }
 
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.toast-enter {
+  animation: toast-in 0.22s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toast-enter {
+    animation: none;
+  }
+}
+
 .scrollbar-soft::-webkit-scrollbar {
   width: 10px;
   height: 10px;
@@ -112,6 +133,16 @@ textarea:focus-visible {
 
   .icon-button:hover {
     background: var(--panel-muted);
+  }
+
+  .icon-button.is-active {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: #fff;
+  }
+
+  .icon-button.is-active:hover {
+    background: var(--primary-dark);
   }
 
   .section-title {

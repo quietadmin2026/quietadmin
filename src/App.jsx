@@ -654,7 +654,8 @@ function App() {
   const [clientTab, setClientTab] = useState('Overview');
   const [paymentDraft, setPaymentDraft] = useState({ clientId: 'c1', amount: 2500, method: 'UPI', reference: '', notes: '' });
   const [clientDraft, setClientDraft] = useState(emptyClient());
-  const [notice, setNotice] = useState('');
+  const [toast, setToast] = useState(null); // { id, message, action }
+  const toastTimer = useRef(null);
   const [importResult, setImportResult] = useState(null);
 
   const driveData = useMemo(
@@ -719,9 +720,20 @@ function App() {
   const attendanceRate = monthSessions.length ? Math.round((attendedThisMonth / monthSessions.length) * 100) : 0;
   const selectedClient = clientById[selectedClientId] || clients[0];
 
-  function showNotice(message) {
-    setNotice(message);
-    window.setTimeout(() => setNotice(''), 2600);
+  // Toast: a small, self-dismissing acknowledgement in the corner. An optional
+  // `action` (e.g. Undo) keeps the toast up a little longer and adds a button.
+  function showNotice(message, action = null) {
+    if (toastTimer.current) window.clearTimeout(toastTimer.current);
+    const id = Date.now();
+    setToast({ id, message, action });
+    toastTimer.current = window.setTimeout(() => {
+      setToast((current) => (current && current.id === id ? null : current));
+    }, action ? 6000 : 3200);
+  }
+
+  function dismissToast() {
+    if (toastTimer.current) window.clearTimeout(toastTimer.current);
+    setToast(null);
   }
 
   function statusSession(sessionId, nextStatus) {
@@ -756,7 +768,10 @@ function App() {
       current.map((item) => (item.id === sessionId ? { ...item, status: nextStatus, chargeId: newCharge?.id || item.chargeId } : item)),
     );
     if (newCharge && newCharge.amount > 0) setCharges((current) => [...current, newCharge]);
-    showNotice(`${client.name} marked ${nextStatus.toLowerCase()}.`);
+    showNotice(`${client.name} marked ${nextStatus.toLowerCase()}.`, {
+      label: 'Undo',
+      onClick: () => undoSession(sessionId),
+    });
   }
 
   function undoSession(sessionId) {
@@ -898,6 +913,7 @@ function App() {
   return (
     <main className={`${themeClass[settings.theme]} min-h-screen bg-[var(--bg)] text-[var(--text)]`}>
       {importResult && <ImportSummary result={importResult} onClose={() => setImportResult(null)} />}
+      <Toast toast={toast} onDismiss={dismissToast} />
       <div className="flex min-h-screen">
         <aside className="hidden w-72 shrink-0 border-r border-[var(--line)] bg-[var(--panel)] px-5 py-6 lg:block">
           <Brand />
@@ -931,7 +947,6 @@ function App() {
           <MobileNav activeNav={activeNav} setActiveNav={setActiveNav} />
           <div className="mx-auto max-w-7xl px-4 py-5 sm:px-6 lg:px-8">
             <TopBar settings={settings} drive={drive} signOut={signOut} />
-            {notice && <div className="mb-4 rounded-md bg-[var(--primary)] px-4 py-3 text-sm font-medium text-white shadow-soft">{notice}</div>}
 
             {activeNav === 'Dashboard' && (
               <Dashboard
@@ -1289,10 +1304,10 @@ function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient,
                       <p className="text-sm text-[var(--subtle)]">Outstanding {formatMoney(ledger?.outstanding || 0)}</p>
                     </div>
                     <div className="flex flex-wrap gap-2">
-                      <SmallAction icon={Check} label="Present" onClick={() => statusSession(session.id, 'Present')} />
-                      <SmallAction icon={Clock3} label="Late Cancel" onClick={() => statusSession(session.id, 'Late Cancel')} />
-                      <SmallAction icon={X} label="Cancel" onClick={() => statusSession(session.id, 'Cancelled')} />
-                      <SmallAction icon={CalendarDays} label="Reschedule" onClick={() => reschedule(session.id)} />
+                      <SmallAction icon={Check} label="Present" active={session.status === 'Present'} onClick={() => statusSession(session.id, 'Present')} />
+                      <SmallAction icon={Clock3} label="Late Cancel" active={session.status === 'Late Cancel'} onClick={() => statusSession(session.id, 'Late Cancel')} />
+                      <SmallAction icon={X} label="Cancel" active={session.status === 'Cancelled'} onClick={() => statusSession(session.id, 'Cancelled')} />
+                      <SmallAction icon={CalendarDays} label="Reschedule" active={session.status === 'Rescheduled'} onClick={() => reschedule(session.id)} />
                       <SmallAction icon={RefreshCcw} label="Undo" onClick={() => undoSession(session.id)} />
                     </div>
                   </div>
@@ -1810,12 +1825,57 @@ function StatusBadge({ status }) {
   return <span className="rounded-md bg-[var(--panel-muted)] px-2 py-1 text-xs font-semibold text-[var(--subtle)]">{status}</span>;
 }
 
-function SmallAction({ icon: Icon, label, onClick }) {
+function SmallAction({ icon: Icon, label, onClick, active = false }) {
   return (
-    <button type="button" className="icon-button px-3 py-2 text-xs" onClick={onClick} title={label}>
+    <button
+      type="button"
+      className={`icon-button px-3 py-2 text-xs${active ? ' is-active' : ''}`}
+      onClick={onClick}
+      title={label}
+      aria-pressed={active}
+    >
       <Icon size={15} />
       {label}
     </button>
+  );
+}
+
+function Toast({ toast, onDismiss }) {
+  if (!toast) return null;
+  return (
+    <div className="pointer-events-none fixed inset-x-0 bottom-0 z-50 flex justify-center px-4 pb-5 sm:inset-x-auto sm:right-6 sm:justify-end">
+      <div
+        key={toast.id}
+        role="status"
+        aria-live="polite"
+        className="toast-enter pointer-events-auto flex w-full max-w-sm items-center gap-3 rounded-lg border border-[var(--line)] bg-[var(--panel)] px-4 py-3 shadow-soft"
+      >
+        <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-[var(--primary)] text-white">
+          <Check size={16} />
+        </span>
+        <p className="min-w-0 flex-1 text-sm font-medium text-[var(--text)]">{toast.message}</p>
+        {toast.action && (
+          <button
+            type="button"
+            className="shrink-0 text-sm font-semibold text-[var(--primary)] hover:underline"
+            onClick={() => {
+              toast.action.onClick();
+              onDismiss();
+            }}
+          >
+            {toast.action.label}
+          </button>
+        )}
+        <button
+          type="button"
+          className="shrink-0 rounded-md p-1 text-[var(--subtle)] hover:bg-[var(--panel-muted)]"
+          onClick={onDismiss}
+          aria-label="Dismiss"
+        >
+          <X size={15} />
+        </button>
+      </div>
+    </div>
   );
 }
 
