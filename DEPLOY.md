@@ -5,10 +5,52 @@ all data lives in the user's browser and their own Google Drive.
 
 Config already in the repo:
 
-- **`wrangler.toml`** — sets the Pages build output dir to `dist`.
-- **`public/_redirects`** — SPA fallback (`/* → /index.html 200`) so any path loads the app.
+- **`vercel.json`** — Vercel build settings + SPA rewrite (all paths → `/index.html`).
+- **`wrangler.toml`** — Cloudflare Pages output dir (only used if you deploy to Cloudflare).
+- **`public/_redirects`** — Cloudflare SPA fallback (ignored by Vercel; harmless).
 - **`.node-version`** — pins Node 20 for the build (Vite 6 needs Node 18+).
-- **`.gitignore`** — keeps `node_modules`, `dist`, and `.env*` out of Git.
+- **`.gitignore`** — keeps `node_modules`, `dist`, `.env*`, and `.vercel` out of Git.
+
+---
+
+# Deploying to Vercel (new project)
+
+This creates a brand-new Vercel project and does NOT touch any existing one.
+
+## Via the Vercel CLI (no GitHub repo needed)
+
+```bash
+cd "path/to/QuietAdmin"
+npx vercel login            # opens the browser to sign in
+npx vercel link             # choose: set up a NEW project (do not link existing); name it e.g. quietadmin-drive
+npx vercel env add VITE_GOOGLE_CLIENT_ID production   # paste your client ID when prompted
+npx vercel --prod           # builds with the env var and deploys; prints your live URL
+```
+
+(Optionally repeat the `env add` for `preview` and `development` if you want the
+Client ID available on preview builds and `vercel dev` too.)
+
+## Via the Vercel dashboard (Git-connected)
+
+1. Push this repo to GitHub (empty repo, nothing pre-added).
+2. Vercel dashboard → **Add New → Project → Import** the repo.
+3. Framework preset: **Vite** (auto-detected). Build `npm run build`, output `dist`.
+4. **Environment Variables:** add `VITE_GOOGLE_CLIENT_ID` = your client ID.
+5. Deploy → you get a `https://<project>.vercel.app` URL.
+
+## After deploy — REQUIRED for Google login
+
+Add the new Vercel URL to the OAuth client's **Authorized JavaScript origins**
+(Google Cloud Console → APIs & Services → Credentials → your OAuth client):
+
+- `https://<your-new-project>.vercel.app`
+
+Note: `VITE_*` variables are baked in at **build time**, so set the env var BEFORE
+the production build. If you deploy first and add it after, redeploy so it takes effect.
+
+---
+
+# Deploying to Cloudflare Pages (alternative)
 
 ## Option A — Git-connected (recommended)
 
