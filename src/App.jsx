@@ -4,6 +4,8 @@ import {
   BarChart3,
   CalendarDays,
   Check,
+  ChevronLeft,
+  ChevronRight,
   Clock3,
   CreditCard,
   Download,
@@ -220,6 +222,7 @@ const SAMPLE_PAYMENTS = [
 
 const navItems = [
   ['Dashboard', LayoutDashboard],
+  ['Schedule', CalendarDays],
   ['Clients', Users],
   ['Groups', FolderOpen],
   ['Payments', CreditCard],
@@ -656,6 +659,14 @@ function isoAddDays(iso, days) {
   return isoOf(d);
 }
 
+// Monday-anchored start of the week containing `iso`.
+function startOfWeekIso(iso) {
+  const d = toDate(iso);
+  const back = (d.getDay() + 6) % 7; // 0 for Monday … 6 for Sunday
+  d.setDate(d.getDate() - back);
+  return isoOf(d);
+}
+
 // A recurring client's weekly slots: the primary day/time and an optional second.
 function clientSlots(client) {
   const slots = [];
@@ -870,14 +881,24 @@ function App() {
     showNotice('Session returned to scheduled.');
   }
 
-  function reschedule(sessionId) {
+  // Move a session to a chosen date/time: the original becomes a 'Rescheduled'
+  // record and a fresh, sticky (never auto-pruned) session is created at the new
+  // slot. Without an explicit date it defaults to one week ahead, same time.
+  function reschedule(sessionId, newDate, newTime) {
     const session = sessions.find((item) => item.id === sessionId);
-    const nextDate = new Date(`${session.date}T${session.time}`);
-    nextDate.setDate(nextDate.getDate() + 7);
+    if (!session) return;
+    let date = newDate;
+    if (!date) {
+      const fallback = new Date(`${session.date}T${session.time || '00:00'}`);
+      fallback.setDate(fallback.getDate() + 7);
+      date = fallback.toISOString().slice(0, 10);
+    }
+    const time = newTime || session.time;
     const replacement = {
       ...session,
       id: `s${Date.now()}`,
-      date: nextDate.toISOString().slice(0, 10),
+      date,
+      time,
       status: 'Scheduled',
       chargeId: null,
       auto: false, // a rescheduled slot is a therapist action — never auto-pruned
@@ -885,7 +906,19 @@ function App() {
     setSessions((current) =>
       current.map((item) => (item.id === sessionId ? { ...item, status: 'Rescheduled' } : item)).concat(replacement),
     );
-    showNotice('Replacement session created one week ahead.');
+    const client = clientById[session.clientId];
+    showNotice(`${client?.name || 'Session'} moved to ${formatDate(date, { weekday: 'short', day: '2-digit', month: 'short' })} ${time}.`);
+  }
+
+  // Remove a one-off (manual or rescheduled) session outright, along with any
+  // charge it created. Recurring auto sessions are never removed this way — they
+  // would just regenerate — so the UI offers this only for non-auto sessions.
+  function removeSession(sessionId) {
+    const session = sessions.find((item) => item.id === sessionId);
+    if (!session) return;
+    setSessions((current) => current.filter((item) => item.id !== sessionId));
+    if (session.chargeId) setCharges((current) => current.filter((charge) => charge.id !== session.chargeId));
+    showNotice('Session removed.');
   }
 
   function addSession(draft) {
@@ -1074,9 +1107,22 @@ function App() {
                 statusSession={statusSession}
                 undoSession={undoSession}
                 reschedule={reschedule}
+                removeSession={removeSession}
                 addSession={addSession}
                 setPaymentDraft={setPaymentDraft}
                 setActiveNav={setActiveNav}
+              />
+            )}
+
+            {activeNav === 'Schedule' && (
+              <Schedule
+                sessions={sessions}
+                clients={clientById}
+                ledgerByClient={ledgerByClient}
+                statusSession={statusSession}
+                undoSession={undoSession}
+                reschedule={reschedule}
+                removeSession={removeSession}
               />
             )}
 
@@ -1377,11 +1423,12 @@ function MobileNav({ activeNav, setActiveNav }) {
   );
 }
 
-function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient, stats, statusSession, undoSession, reschedule, addSession, setPaymentDraft, setActiveNav }) {
+function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient, stats, statusSession, undoSession, reschedule, removeSession, addSession, setPaymentDraft, setActiveNav }) {
   const outstandingClients = Object.values(clients).filter((client) => ledgerByClient[client.id]?.outstanding > 0);
   const activeClients = Object.values(clients).filter((client) => client.status === 'Active');
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState({ clientId: '', date: todayIso, time: '10:00', duration: 60 });
+  const [modalSession, setModalSession] = useState(null);
 
   function submitSession(event) {
     event.preventDefault();
@@ -1472,7 +1519,7 @@ function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient,
                       <SmallAction icon={Check} label="Present" active={session.status === 'Present'} onClick={() => statusSession(session.id, 'Present')} />
                       <SmallAction icon={Clock3} label="Late Cancel" active={session.status === 'Late Cancel'} onClick={() => statusSession(session.id, 'Late Cancel')} />
                       <SmallAction icon={X} label="Cancel" active={session.status === 'Cancelled'} onClick={() => statusSession(session.id, 'Cancelled')} />
-                      <SmallAction icon={CalendarDays} label="Reschedule" active={session.status === 'Rescheduled'} onClick={() => reschedule(session.id)} />
+                      <SmallAction icon={CalendarDays} label="Reschedule" active={session.status === 'Rescheduled'} onClick={() => setModalSession(session)} />
                       <SmallAction icon={RefreshCcw} label="Undo" onClick={() => undoSession(session.id)} />
                     </div>
                   </div>
@@ -1521,6 +1568,194 @@ function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient,
           </div>
         </Panel>
       </section>
+
+      {modalSession && (
+        <SessionModal
+          session={modalSession}
+          client={clients[modalSession.clientId]}
+          ledger={ledgerByClient[modalSession.clientId]}
+          statusSession={statusSession}
+          undoSession={undoSession}
+          reschedule={reschedule}
+          removeSession={removeSession}
+          onClose={() => setModalSession(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+// Subtle, theme-friendly tint per status so the week reads at a glance.
+const STATUS_TONE = {
+  Scheduled: { chip: 'border-[var(--line)] bg-[var(--panel)]', dot: 'bg-[var(--primary)]' },
+  Present: { chip: 'border-emerald-300 bg-emerald-50', dot: 'bg-emerald-500' },
+  'Late Cancel': { chip: 'border-amber-300 bg-amber-50', dot: 'bg-amber-500' },
+  Cancelled: { chip: 'border-[var(--line)] bg-[var(--panel-muted)] opacity-70', dot: 'bg-[var(--subtle)]' },
+  Rescheduled: { chip: 'border-[var(--line)] bg-[var(--panel-muted)] opacity-70', dot: 'bg-[var(--subtle)]' },
+};
+
+function Schedule({ sessions, clients, ledgerByClient, statusSession, undoSession, reschedule, removeSession }) {
+  const [weekStart, setWeekStart] = useState(() => startOfWeekIso(todayIso));
+  const [modalSession, setModalSession] = useState(null);
+
+  const days = Array.from({ length: 7 }, (_, i) => isoAddDays(weekStart, i));
+  const weekEnd = days[6];
+  const byDay = useMemo(() => {
+    const map = Object.fromEntries(days.map((iso) => [iso, []]));
+    for (const session of sessions) {
+      if (session.date in map) map[session.date].push(session);
+    }
+    for (const iso of days) map[iso].sort((a, b) => a.time.localeCompare(b.time));
+    return map;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessions, weekStart]);
+
+  const rangeLabel = `${formatDate(weekStart, { day: '2-digit', month: 'short' })} – ${formatDate(weekEnd, { day: '2-digit', month: 'short' })}`;
+
+  return (
+    <div className="space-y-5">
+      <Panel>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h3 className="section-title">Schedule</h3>
+            <p className="section-subtitle">{rangeLabel} · tap a session to mark, reschedule or remove it.</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button type="button" className="icon-button px-3 py-2 text-xs" onClick={() => setWeekStart(isoAddDays(weekStart, -7))} aria-label="Previous week">
+              <ChevronLeft size={16} />
+            </button>
+            <button type="button" className="icon-button px-3 py-2 text-xs" onClick={() => setWeekStart(startOfWeekIso(todayIso))}>
+              This week
+            </button>
+            <button type="button" className="icon-button px-3 py-2 text-xs" onClick={() => setWeekStart(isoAddDays(weekStart, 7))} aria-label="Next week">
+              <ChevronRight size={16} />
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-7">
+          {days.map((iso) => {
+            const isToday = iso === todayIso;
+            const dayed = byDay[iso];
+            return (
+              <div key={iso} className={`rounded-md border p-2 ${isToday ? 'border-[var(--primary)] bg-[var(--bg)]' : 'border-[var(--line)] bg-[var(--panel)]'}`}>
+                <div className="mb-2 flex items-baseline justify-between px-1">
+                  <span className={`text-xs font-semibold uppercase tracking-wide ${isToday ? 'text-[var(--primary)]' : 'text-[var(--subtle)]'}`}>
+                    {formatDate(iso, { weekday: 'short' })}
+                  </span>
+                  <span className={`text-sm font-semibold ${isToday ? 'text-[var(--primary)]' : ''}`}>{formatDate(iso, { day: '2-digit' })}</span>
+                </div>
+                <div className="space-y-2">
+                  {dayed.length === 0 && <p className="px-1 py-3 text-center text-xs text-[var(--subtle)]">—</p>}
+                  {dayed.map((session) => {
+                    const client = clients[session.clientId];
+                    if (!client) return null;
+                    const tone = STATUS_TONE[session.status] || STATUS_TONE.Scheduled;
+                    return (
+                      <button
+                        key={session.id}
+                        type="button"
+                        onClick={() => setModalSession(session)}
+                        className={`w-full rounded-md border px-2 py-1.5 text-left transition hover:brightness-95 ${tone.chip}`}
+                      >
+                        <span className="flex items-center gap-1.5">
+                          <span className={`h-2 w-2 shrink-0 rounded-full ${tone.dot}`} />
+                          <span className="text-xs font-semibold">{session.time}</span>
+                        </span>
+                        <span className="mt-0.5 block truncate text-sm font-medium">{client.name}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </Panel>
+
+      {modalSession && (
+        <SessionModal
+          session={modalSession}
+          client={clients[modalSession.clientId]}
+          ledger={ledgerByClient[modalSession.clientId]}
+          statusSession={statusSession}
+          undoSession={undoSession}
+          reschedule={reschedule}
+          removeSession={removeSession}
+          onClose={() => setModalSession(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function SessionModal({ session, client, ledger, statusSession, undoSession, reschedule, removeSession, onClose }) {
+  const [date, setDate] = useState(() => isoAddDays(session.date, 7));
+  const [time, setTime] = useState(session.time);
+  const runAndClose = (fn) => {
+    fn();
+    onClose();
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
+      <div className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-lg border border-[var(--line)] bg-[var(--panel)] p-5 shadow-soft" onClick={(event) => event.stopPropagation()}>
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h2 className="text-xl font-semibold">{client?.name || 'Session'}</h2>
+            <p className="mt-1 text-sm text-[var(--subtle)]">
+              {formatDate(session.date, { weekday: 'long', day: '2-digit', month: 'short' })} · {session.time} · {session.duration || 60} min
+            </p>
+          </div>
+          <button type="button" className="rounded-md p-1 text-[var(--subtle)] hover:bg-[var(--panel-muted)]" onClick={onClose} aria-label="Close">
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="mt-3 flex items-center gap-3">
+          <StatusBadge status={session.status} />
+          <span className="text-sm text-[var(--subtle)]">Outstanding {formatMoney(ledger?.outstanding || 0)}</span>
+        </div>
+
+        <div className="mt-4">
+          <p className="text-xs font-semibold uppercase tracking-wide text-[var(--subtle)]">Attendance</p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <SmallAction icon={Check} label="Present" active={session.status === 'Present'} onClick={() => runAndClose(() => statusSession(session.id, 'Present'))} />
+            <SmallAction icon={Clock3} label="Late Cancel" active={session.status === 'Late Cancel'} onClick={() => runAndClose(() => statusSession(session.id, 'Late Cancel'))} />
+            <SmallAction icon={X} label="Cancel" active={session.status === 'Cancelled'} onClick={() => runAndClose(() => statusSession(session.id, 'Cancelled'))} />
+            {session.status !== 'Scheduled' && (
+              <SmallAction icon={RefreshCcw} label="Undo" onClick={() => runAndClose(() => undoSession(session.id))} />
+            )}
+          </div>
+        </div>
+
+        <div className="mt-4 rounded-md border border-[var(--line)] bg-[var(--bg)] p-3">
+          <p className="text-xs font-semibold uppercase tracking-wide text-[var(--subtle)]">Reschedule</p>
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            <Input label="New date" type="date" value={date} onChange={setDate} />
+            <Input label="New time" type="time" value={time} onChange={setTime} />
+          </div>
+          <button
+            type="button"
+            className="mt-3 w-full rounded-md bg-[var(--primary)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--primary-dark)]"
+            onClick={() => runAndClose(() => reschedule(session.id, date, time))}
+          >
+            Move session
+          </button>
+        </div>
+
+        {!session.auto && (
+          <button
+            type="button"
+            className="mt-4 text-sm font-medium text-[var(--accent)] hover:underline"
+            onClick={() => {
+              if (window.confirm('Remove this session? This cannot be undone.')) runAndClose(() => removeSession(session.id));
+            }}
+          >
+            Remove session
+          </button>
+        )}
+      </div>
     </div>
   );
 }
