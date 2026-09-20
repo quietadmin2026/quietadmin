@@ -49,6 +49,7 @@ const initialSettings = {
   monthlyStatements: true,
   outstandingReminders: true,
   theme: 'Quiet Cream',
+  onboarded: false,
 };
 
 const initialClients = [
@@ -242,6 +243,13 @@ function toDate(value) {
   return new Date(`${value}T00:00:00`);
 }
 
+function greetingFor(date = new Date()) {
+  const hour = date.getHours();
+  if (hour < 12) return 'Good Morning';
+  if (hour < 17) return 'Good Afternoon';
+  return 'Good Evening';
+}
+
 function formatDate(value, options = { day: '2-digit', month: 'short' }) {
   return toDate(value).toLocaleDateString('en-IN', options);
 }
@@ -388,7 +396,9 @@ function App() {
 
   const applyRemote = useCallback((remote) => {
     if (remote.settings && typeof remote.settings === 'object' && !Array.isArray(remote.settings)) {
-      setSettings({ ...initialSettings, ...remote.settings });
+      // A settings file already on Drive means this therapist has set up before,
+      // so treat them as onboarded even if the file predates the onboarded flag.
+      setSettings({ ...initialSettings, ...remote.settings, onboarded: true });
     }
     if (Array.isArray(remote.clients)) setClients(remote.clients);
     if (Array.isArray(remote.groups)) setGroups(remote.groups);
@@ -499,7 +509,8 @@ function App() {
   function recordPayment(event) {
     event.preventDefault();
     const amount = Number(paymentDraft.amount);
-    if (!paymentDraft.clientId || amount <= 0) return;
+    const client = clientById[paymentDraft.clientId];
+    if (!client || amount <= 0) return;
     setPayments((current) => [
       ...current,
       {
@@ -512,7 +523,7 @@ function App() {
         notes: paymentDraft.notes,
       },
     ]);
-    showNotice(`Payment recorded for ${clientById[paymentDraft.clientId].name}.`);
+    showNotice(`Payment recorded for ${client.name}.`);
     setPaymentDraft({ ...paymentDraft, amount: 2500, reference: '', notes: '' });
   }
 
@@ -525,6 +536,29 @@ function App() {
     setSelectedClientId(id);
     setClientDraft(emptyClient());
     showNotice('Client added.');
+  }
+
+  function completeOnboarding({ therapistName, practiceName, paymentDetails, startEmpty }) {
+    setSettings((prev) => ({
+      ...prev,
+      therapistName: therapistName.trim() || prev.therapistName,
+      practiceName: practiceName.trim() || prev.practiceName,
+      paymentDetails: paymentDetails.trim(),
+      onboarded: true,
+    }));
+    if (startEmpty) {
+      setClients([]);
+      setGroups([]);
+      setSessions([]);
+      setCharges([]);
+      setPayments([]);
+      setSelectedClientId('');
+    }
+    showNotice('Welcome to QuietAdmin.');
+  }
+
+  function skipOnboarding() {
+    setSettings((prev) => ({ ...prev, onboarded: true }));
   }
 
   function resetData() {
@@ -559,6 +593,7 @@ function App() {
 
   return (
     <main className={`${themeClass[settings.theme]} min-h-screen bg-[var(--bg)] text-[var(--text)]`}>
+      {!settings.onboarded && <Onboarding onComplete={completeOnboarding} onSkip={skipOnboarding} drive={drive} />}
       <div className="flex min-h-screen">
         <aside className="hidden w-72 shrink-0 border-r border-[var(--line)] bg-[var(--panel)] px-5 py-6 lg:block">
           <Brand />
@@ -684,6 +719,74 @@ function App() {
   );
 }
 
+function Onboarding({ onComplete, onSkip, drive }) {
+  const [therapistName, setTherapistName] = useState('');
+  const [practiceName, setPracticeName] = useState('');
+  const [paymentDetails, setPaymentDetails] = useState('');
+  const [startEmpty, setStartEmpty] = useState(true);
+
+  function submit(event) {
+    event.preventDefault();
+    if (!therapistName.trim()) return;
+    onComplete({ therapistName, practiceName, paymentDetails, startEmpty });
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+      <div className="max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-lg border border-[var(--line)] bg-[var(--panel)] p-5 shadow-soft sm:p-6">
+        <div className="flex items-center gap-3">
+          <div className="grid h-10 w-10 place-items-center rounded-md bg-[var(--primary)] text-white">
+            <ReceiptText size={21} />
+          </div>
+          <div>
+            <h2 className="text-2xl font-semibold">Welcome to QuietAdmin</h2>
+            <p className="text-sm text-[var(--subtle)]">Let’s personalise your workspace. You can change any of this later in Settings.</p>
+          </div>
+        </div>
+
+        <form className="mt-5 grid gap-3" onSubmit={submit}>
+          <Input label="Your name" value={therapistName} onChange={setTherapistName} />
+          <Input label="Practice name" value={practiceName} onChange={setPracticeName} />
+          <Input label="Payment details (UPI / bank) — optional" value={paymentDetails} onChange={setPaymentDetails} />
+          <div className="rounded-md border border-[var(--line)] bg-[var(--bg)] p-3">
+            <p className="text-sm font-medium">Starting point</p>
+            <label className="mt-2 flex items-center gap-2 text-sm">
+              <input type="radio" name="seed" className="accent-[var(--primary)]" checked={startEmpty} onChange={() => setStartEmpty(true)} />
+              Start with an empty workspace
+            </label>
+            <label className="mt-1 flex items-center gap-2 text-sm">
+              <input type="radio" name="seed" className="accent-[var(--primary)]" checked={!startEmpty} onChange={() => setStartEmpty(false)} />
+              Keep sample clients to explore first
+            </label>
+          </div>
+          <button
+            type="submit"
+            className="icon-button justify-center bg-[var(--primary)] text-white hover:bg-[var(--primary-dark)] disabled:opacity-50"
+            disabled={!therapistName.trim()}
+          >
+            Get started
+          </button>
+        </form>
+
+        <div className="mt-4 border-t border-[var(--line)] pt-4">
+          <p className="text-sm text-[var(--subtle)]">Already using QuietAdmin on another device?</p>
+          <div className="mt-2 flex flex-wrap items-center gap-3">
+            {drive.configured && (
+              <button type="button" className="icon-button" onClick={drive.connect}>
+                <Cloud size={16} />
+                Connect Google Drive to restore
+              </button>
+            )}
+            <button type="button" className="text-sm text-[var(--subtle)] underline" onClick={onSkip}>
+              Skip for now
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Brand() {
   return (
     <div>
@@ -706,7 +809,7 @@ function TopBar({ settings, exportJson, drive }) {
     <header className="mb-5 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
       <div>
         <p className="text-sm text-[var(--subtle)]">{settings.practiceName}</p>
-        <h2 className="text-2xl font-semibold sm:text-3xl">Good Morning, {settings.therapistName}</h2>
+        <h2 className="text-2xl font-semibold sm:text-3xl">{greetingFor()}, {settings.therapistName}</h2>
         <p className="mt-1 text-sm text-[var(--subtle)]">{currentDate}</p>
       </div>
       <div className="flex flex-col items-stretch gap-2 md:items-end">
@@ -873,10 +976,10 @@ function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient,
 }
 
 function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessions, charges, payments, clientTab, setClientTab, clientDraft, setClientDraft, addClient, exportClientsCsv, exportJson }) {
-  const selectedSessions = sessions.filter((session) => session.clientId === selectedClient.id);
-  const selectedCharges = charges.filter((charge) => charge.clientId === selectedClient.id);
-  const selectedPayments = payments.filter((payment) => payment.clientId === selectedClient.id);
-  const ledger = ledgers[selectedClient.id];
+  const selectedSessions = selectedClient ? sessions.filter((session) => session.clientId === selectedClient.id) : [];
+  const selectedCharges = selectedClient ? charges.filter((charge) => charge.clientId === selectedClient.id) : [];
+  const selectedPayments = selectedClient ? payments.filter((payment) => payment.clientId === selectedClient.id) : [];
+  const ledger = selectedClient ? ledgers[selectedClient.id] : null;
   const timeline = [
     ...selectedSessions.map((session) => ({ date: session.date, text: `Session ${session.status}` })),
     ...selectedPayments.map((payment) => ({ date: payment.date, text: `Payment ${currency.format(payment.amount)}` })),
@@ -945,16 +1048,18 @@ function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessio
       <Panel>
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div>
-            <h3 className="text-2xl font-semibold">{selectedClient.name}</h3>
-            <p className="text-sm text-[var(--subtle)]">{selectedClient.email} - {selectedClient.phone}</p>
+            <h3 className="text-2xl font-semibold">{selectedClient ? selectedClient.name : 'No clients yet'}</h3>
+            <p className="text-sm text-[var(--subtle)]">
+              {selectedClient ? `${selectedClient.email} - ${selectedClient.phone}` : 'Add your first client with the form on the left.'}
+            </p>
           </div>
           <div className="flex flex-wrap gap-2">
-            {selectedClient.tags.map((tag) => <span key={tag} className="rounded-md bg-[var(--panel-muted)] px-2 py-1 text-xs font-medium">{tag}</span>)}
+            {(selectedClient?.tags || []).map((tag) => <span key={tag} className="rounded-md bg-[var(--panel-muted)] px-2 py-1 text-xs font-medium">{tag}</span>)}
           </div>
         </div>
         <Segmented className="mt-4" options={['Overview', 'Sessions', 'Financials', 'Timeline']} value={clientTab} onChange={setClientTab} />
         <div className="mt-5">
-          {clientTab === 'Overview' && (
+          {clientTab === 'Overview' && selectedClient && ledger && (
             <div className="grid gap-3 sm:grid-cols-2">
               <MiniMetric label="Outstanding Balance" value={currency.format(ledger.outstanding)} />
               <MiniMetric label="Credit Balance" value={currency.format(ledger.credit)} />
@@ -966,7 +1071,7 @@ function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessio
             </div>
           )}
           {clientTab === 'Sessions' && <SimpleTable headers={['Date', 'Status', 'Charge']} rows={selectedSessions.map((session) => [formatDate(session.date), session.status, session.chargeId ? 'Generated' : '-'])} />}
-          {clientTab === 'Financials' && (
+          {clientTab === 'Financials' && selectedClient && ledger && (
             <div className="grid gap-3 sm:grid-cols-2">
               <MiniMetric label="Total Charges" value={currency.format(ledger.totalCharges)} />
               <MiniMetric label="Total Payments" value={currency.format(ledger.totalPayments)} />
