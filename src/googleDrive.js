@@ -217,7 +217,6 @@ export function useGoogleDrive({ clientId, data, applyRemote }) {
       const profile = await fetchUserProfile(token);
       setEmail(profile.email);
       setName(profile.name);
-      setSignedIn(true);
 
       setStatus('syncing');
       let folderId = await findFolder(token);
@@ -266,6 +265,10 @@ export function useGoogleDrive({ clientId, data, applyRemote }) {
         FILE_KEYS.map(([key]) => [key, JSON.stringify(effective[key])]),
       );
       readyRef.current = true;
+      // Only now, after the Drive profile has been pulled and applied, do we mark
+      // the session signed in — so the gate never flashes the Setup form to a user
+      // whose profile is still loading, and a late applyRemote can't overwrite it.
+      setSignedIn(true);
       setLastSyncedAt(Date.now());
       setStatus('connected');
       return true;
