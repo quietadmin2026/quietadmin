@@ -19,6 +19,7 @@ import {
   Plus,
   ReceiptText,
   RefreshCcw,
+  RotateCcw,
   Settings,
   Users,
   WalletCards,
@@ -1187,7 +1188,7 @@ function App() {
               />
             )}
 
-            {activeNav === 'Settings' && <SettingsScreen settings={settings} setSettings={setSettings} loadSampleData={loadSampleData} exportJson={exportJson} drive={drive} />}
+            {activeNav === 'Settings' && <SettingsScreen settings={settings} setSettings={setSettings} loadSampleData={loadSampleData} exportJson={exportJson} drive={drive} onNotice={showNotice} />}
           </div>
         </section>
       </div>
@@ -2123,7 +2124,7 @@ function Reports({ stats, exportJson }) {
   );
 }
 
-function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, drive }) {
+function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, drive, onNotice }) {
   return (
     <div className="grid gap-5 xl:grid-cols-2">
       <Panel>
@@ -2151,6 +2152,7 @@ function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, dri
             </button>
           </div>
         </div>
+        <BackupManager drive={drive} onNotice={onNotice} />
       </Panel>
       <Panel>
         <h3 className="section-title">Billing and Reminders</h3>
@@ -2162,6 +2164,124 @@ function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, dri
           <Toggle label="Outstanding Reminders" checked={settings.outstandingReminders} onChange={(checked) => setSettings({ ...settings, outstandingReminders: checked })} />
         </div>
       </Panel>
+    </div>
+  );
+}
+
+function formatBackupTime(ms) {
+  return new Date(ms).toLocaleString('en-IN', {
+    day: 'numeric',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function BackupManager({ drive, onNotice }) {
+  const signedIn = Boolean(drive?.signedIn);
+  const [open, setOpen] = useState(false);
+  const [backups, setBackups] = useState(null); // null = not loaded yet
+  const [loading, setLoading] = useState(false);
+  const [restoringId, setRestoringId] = useState('');
+
+  const refresh = useCallback(async () => {
+    if (!signedIn) return;
+    setLoading(true);
+    try {
+      setBackups(await drive.listBackups());
+    } catch {
+      setBackups([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [drive, signedIn]);
+
+  useEffect(() => {
+    if (open && backups === null) refresh();
+  }, [open, backups, refresh]);
+
+  async function handleBackupNow() {
+    const result = await drive.backupNow();
+    if (result.ok) {
+      onNotice?.('Backup saved to Drive.');
+      setBackups(null); // force a fresh list next time it opens
+      if (open) refresh();
+    } else {
+      onNotice?.(result.error || 'Backup failed.');
+    }
+  }
+
+  async function handleRestore(backup) {
+    const when = backup.createdAt ? formatBackupTime(backup.createdAt) : backup.name;
+    if (
+      !window.confirm(
+        `Restore the backup from ${when}? This replaces all current clients, sessions, charges and payments with that snapshot.`,
+      )
+    ) {
+      return;
+    }
+    setRestoringId(backup.id);
+    const result = await drive.restoreBackup(backup.id);
+    setRestoringId('');
+    onNotice?.(result.ok ? `Restored backup from ${when}.` : result.error || 'Restore failed.');
+  }
+
+  return (
+    <div className="mt-4 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
+      <p className="text-sm font-semibold">Dated Drive backups</p>
+      <p className="mt-1 text-sm text-[var(--subtle)]">
+        {signedIn
+          ? drive.lastBackupAt
+            ? `Last backup ${formatBackupTime(drive.lastBackupAt)}. `
+            : 'No backup yet. '
+          : 'Sign in to Google Drive to enable backups. '}
+        A snapshot is saved automatically once a day; the newest 30 are kept.
+      </p>
+      <div className="mt-3 flex flex-wrap gap-2">
+        <button className="icon-button" type="button" onClick={handleBackupNow} disabled={!signedIn || drive.backingUp}>
+          <Cloud size={17} />
+          {drive.backingUp ? 'Backing up…' : 'Back up now'}
+        </button>
+        <button
+          className="icon-button"
+          type="button"
+          onClick={() => setOpen((value) => !value)}
+          disabled={!signedIn}
+          aria-expanded={open}
+        >
+          <History size={17} />
+          {open ? 'Hide backups' : 'Restore from backup'}
+        </button>
+      </div>
+      {open && (
+        <div className="mt-3">
+          {loading && <p className="text-sm text-[var(--subtle)]">Loading backups…</p>}
+          {!loading && backups && backups.length === 0 && (
+            <p className="text-sm text-[var(--subtle)]">No backups found yet.</p>
+          )}
+          {!loading && backups && backups.length > 0 && (
+            <ul className="scrollbar-soft max-h-64 space-y-1 overflow-auto rounded-md border border-[var(--line)] bg-[var(--panel)] p-2">
+              {backups.map((backup) => (
+                <li key={backup.id} className="flex items-center justify-between gap-3 rounded px-2 py-2 text-sm">
+                  <span className="flex items-center gap-2 text-[var(--text)]">
+                    <Clock3 size={14} className="text-[var(--subtle)]" />
+                    {backup.createdAt ? formatBackupTime(backup.createdAt) : backup.name}
+                  </span>
+                  <button
+                    type="button"
+                    className="inline-flex shrink-0 items-center gap-1 text-sm font-semibold text-[var(--primary)] hover:underline disabled:opacity-50"
+                    onClick={() => handleRestore(backup)}
+                    disabled={Boolean(restoringId)}
+                  >
+                    <RotateCcw size={14} />
+                    {restoringId === backup.id ? 'Restoring…' : 'Restore'}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
     </div>
   );
 }

@@ -3,6 +3,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 // Least-privilege Drive access: the app can only see files it created itself.
 const SCOPES = 'openid email profile https://www.googleapis.com/auth/drive.file';
 const FOLDER_NAME = 'QuietAdmin';
+// Dated snapshots live in a subfolder so the live files stay uncluttered.
+const BACKUP_FOLDER_NAME = 'backups';
+// Keep a month of daily restore points; older ones are trashed (recoverable).
+const MAX_BACKUPS = 30;
+const BACKUP_PREFIX = 'backup-';
 
 // App state key -> Drive filename. Order is stable so sync is deterministic.
 export const FILE_KEYS = [
@@ -165,6 +170,86 @@ async function updateFile(token, fileId, content) {
   });
 }
 
+async function findChildFolder(token, parentId, name) {
+  const q = encodeURIComponent(
+    `mimeType='application/vnd.google-apps.folder' and name='${name}' and '${parentId}' in parents and trashed=false`,
+  );
+  const response = await driveFetch(
+    `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&spaces=drive`,
+    token,
+  );
+  const json = await response.json();
+  return json.files?.[0]?.id || null;
+}
+
+async function createChildFolder(token, parentId, name) {
+  const response = await driveFetch('https://www.googleapis.com/drive/v3/files?fields=id', token, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, parents: [parentId], mimeType: 'application/vnd.google-apps.folder' }),
+  });
+  const json = await response.json();
+  return json.id;
+}
+
+// Move a file to Drive trash rather than hard-deleting it, so a mistaken prune
+// (or a backup someone still wants) stays recoverable for the trash window.
+async function trashFile(token, fileId) {
+  await driveFetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, token, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ trashed: true }),
+  });
+}
+
+// Local timestamp so a backup's name reads in the therapist's own day/time.
+function backupStamp(date = new Date()) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())}-${p(date.getHours())}${p(date.getMinutes())}`;
+}
+
+// The YYYY-MM-DD a backup filename encodes; used to keep automatic backups to
+// one per calendar day. Returns '' for a name that isn't ours.
+function backupDayFromName(name) {
+  if (!name || !name.startsWith(BACKUP_PREFIX)) return '';
+  return name.slice(BACKUP_PREFIX.length, BACKUP_PREFIX.length + 10);
+}
+
+// The local time a backup filename encodes (backup-YYYY-MM-DD-HHmm.json), in ms.
+// Returns null when the name isn't a backup we wrote.
+function backupTimeFromName(name) {
+  const stamp = name.startsWith(BACKUP_PREFIX) ? name.slice(BACKUP_PREFIX.length).replace(/\.json$/, '') : '';
+  const match = /^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})$/.exec(stamp);
+  if (!match) return null;
+  const [, y, mo, d, h, mi] = match;
+  return new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi)).getTime();
+}
+
+async function listBackupFiles(token, backupFolderId) {
+  const files = await listFolderFiles(token, backupFolderId);
+  // Names are zero-padded, so lexical descending order is newest-first.
+  return files
+    .filter((file) => file.name.startsWith(BACKUP_PREFIX))
+    .sort((a, b) => b.name.localeCompare(a.name));
+}
+
+async function writeBackup(token, backupFolderId, snapshot) {
+  const name = `${BACKUP_PREFIX}${backupStamp()}.json`;
+  const content = { version: 1, createdAt: Date.now(), data: snapshot };
+  await createFile(token, backupFolderId, name, content);
+}
+
+// Trash everything past the newest MAX_BACKUPS. `files` is newest-first.
+async function pruneBackups(token, files) {
+  for (const file of files.slice(MAX_BACKUPS)) {
+    try {
+      await trashFile(token, file.id);
+    } catch {
+      // A prune failure is not worth surfacing; retention self-corrects next run.
+    }
+  }
+}
+
 export function useGoogleDrive({ clientId, data, applyRemote }) {
   const [status, setStatus] = useState('disconnected'); // disconnected | connecting | syncing | connected | error
   const [email, setEmail] = useState('');
@@ -172,9 +257,12 @@ export function useGoogleDrive({ clientId, data, applyRemote }) {
   const [signedIn, setSignedIn] = useState(false);
   const [error, setError] = useState('');
   const [lastSyncedAt, setLastSyncedAt] = useState(null);
+  const [lastBackupAt, setLastBackupAt] = useState(null);
+  const [backingUp, setBackingUp] = useState(false);
 
   const tokenRef = useRef(null);
   const folderRef = useRef(null);
+  const backupFolderRef = useRef(null);
   const fileIdsRef = useRef({});
   const snapshotRef = useRef({});
   const readyRef = useRef(false);
@@ -265,6 +353,28 @@ export function useGoogleDrive({ clientId, data, applyRemote }) {
         FILE_KEYS.map(([key]) => [key, JSON.stringify(effective[key])]),
       );
       readyRef.current = true;
+
+      // Dated restore points: ensure a backup folder exists, then take at most
+      // one automatic snapshot per calendar day. A backup problem must never
+      // break sign-in, so the whole step is best-effort.
+      try {
+        let backupFolderId = freshFolder ? null : await findChildFolder(token, folderId, BACKUP_FOLDER_NAME);
+        if (!backupFolderId) backupFolderId = await createChildFolder(token, folderId, BACKUP_FOLDER_NAME);
+        backupFolderRef.current = backupFolderId;
+
+        const backups = await listBackupFiles(token, backupFolderId);
+        const today = backupStamp().slice(0, 10);
+        const haveToday = backups.some((file) => backupDayFromName(file.name) === today);
+        if (!haveToday) {
+          await writeBackup(token, backupFolderId, effective);
+          await pruneBackups(token, await listBackupFiles(token, backupFolderId));
+          setLastBackupAt(Date.now());
+        } else {
+          setLastBackupAt(backupTimeFromName(backups[0]?.name || '') || Date.now());
+        }
+      } catch {
+        // Leave backupFolderRef null; manual "Back up now" will create it later.
+      }
       // Only now, after the Drive profile has been pulled and applied, do we mark
       // the session signed in — so the gate never flashes the Setup form to a user
       // whose profile is still loading, and a late applyRemote can't overwrite it.
@@ -299,6 +409,7 @@ export function useGoogleDrive({ clientId, data, applyRemote }) {
     }
     tokenRef.current = null;
     folderRef.current = null;
+    backupFolderRef.current = null;
     fileIdsRef.current = {};
     snapshotRef.current = {};
     readyRef.current = false;
@@ -307,8 +418,70 @@ export function useGoogleDrive({ clientId, data, applyRemote }) {
     setSignedIn(false);
     setError('');
     setLastSyncedAt(null);
+    setLastBackupAt(null);
     setStatus('disconnected');
   }, []);
+
+  // Ensure the backup subfolder exists and return its id (creating it on first
+  // use for a session that connected before the folder existed).
+  const ensureBackupFolder = useCallback(async (token) => {
+    if (backupFolderRef.current) return backupFolderRef.current;
+    let backupFolderId = await findChildFolder(token, folderRef.current, BACKUP_FOLDER_NAME);
+    if (!backupFolderId) backupFolderId = await createChildFolder(token, folderRef.current, BACKUP_FOLDER_NAME);
+    backupFolderRef.current = backupFolderId;
+    return backupFolderId;
+  }, []);
+
+  // Manual snapshot of the live data, on top of the automatic daily one.
+  const backupNow = useCallback(async () => {
+    if (!readyRef.current || !folderRef.current) return { ok: false, error: 'Connect to Drive first.' };
+    setBackingUp(true);
+    try {
+      await withFreshToken(async (token) => {
+        const backupFolderId = await ensureBackupFolder(token);
+        await writeBackup(token, backupFolderId, dataRef.current);
+        await pruneBackups(token, await listBackupFiles(token, backupFolderId));
+      });
+      setLastBackupAt(Date.now());
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message || 'Backup failed.' };
+    } finally {
+      setBackingUp(false);
+    }
+  }, [ensureBackupFolder, withFreshToken]);
+
+  // Newest-first list of backups with a parsed time, for the restore picker.
+  const listBackups = useCallback(async () => {
+    if (!readyRef.current || !folderRef.current) return [];
+    return withFreshToken(async (token) => {
+      const backupFolderId = await ensureBackupFolder(token);
+      const files = await listBackupFiles(token, backupFolderId);
+      return files.map((file) => ({ id: file.id, name: file.name, createdAt: backupTimeFromName(file.name) }));
+    });
+  }, [ensureBackupFolder, withFreshToken]);
+
+  // Read one backup, validate each file's shape, and hand it to the app. The
+  // restored data then syncs back to the live files through the normal push.
+  const restoreBackup = useCallback(async (fileId) => {
+    if (!readyRef.current) return { ok: false, error: 'Connect to Drive first.' };
+    try {
+      const restored = await withFreshToken(async (token) => {
+        const content = await readFile(token, fileId);
+        const data = content && content.data ? content.data : content;
+        const clean = {};
+        for (const [key] of FILE_KEYS) {
+          if (key in data && hasExpectedShape(key, data[key])) clean[key] = data[key];
+        }
+        return clean;
+      });
+      if (Object.keys(restored).length === 0) return { ok: false, error: 'That backup could not be read.' };
+      applyRemote(restored);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message || 'Restore failed.' };
+    }
+  }, [applyRemote, withFreshToken]);
 
   // Push changed files to Drive, debounced, once the initial sync is done.
   useEffect(() => {
@@ -337,5 +510,21 @@ export function useGoogleDrive({ clientId, data, applyRemote }) {
     return () => window.clearTimeout(handle);
   }, [serialized, status, withFreshToken]);
 
-  return { status, email, name, signedIn, error, lastSyncedAt, connect, trySilent, disconnect, configured: Boolean(clientId) };
+  return {
+    status,
+    email,
+    name,
+    signedIn,
+    error,
+    lastSyncedAt,
+    lastBackupAt,
+    backingUp,
+    connect,
+    trySilent,
+    disconnect,
+    backupNow,
+    listBackups,
+    restoreBackup,
+    configured: Boolean(clientId),
+  };
 }
