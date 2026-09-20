@@ -16,11 +16,13 @@ import {
   LayoutDashboard,
   Mail,
   MessageCircle,
+  Pencil,
   Plus,
   ReceiptText,
   RefreshCcw,
   RotateCcw,
   Settings,
+  Trash2,
   Users,
   WalletCards,
   X,
@@ -1048,6 +1050,39 @@ function App() {
     showNotice('Client added.');
   }
 
+  function updateClient(next) {
+    setClients((current) => current.map((client) => (client.id === next.id ? next : client)));
+    showNotice(`${next.name} updated.`);
+  }
+
+  function updateCharge(id, patch) {
+    setCharges((current) => current.map((charge) => (charge.id === id ? { ...charge, ...patch } : charge)));
+    showNotice('Charge updated.');
+  }
+
+  // Remove a charge and detach any session that pointed at it, with an Undo that
+  // restores both. Daily Drive backups (#3) are the safety net beyond that.
+  function deleteCharge(id) {
+    const removed = charges.find((charge) => charge.id === id);
+    if (!removed) return;
+    const linkedSessionIds = sessions.filter((session) => session.chargeId === id).map((session) => session.id);
+    setCharges((current) => current.filter((charge) => charge.id !== id));
+    if (linkedSessionIds.length) {
+      setSessions((current) => current.map((session) => (session.chargeId === id ? { ...session, chargeId: null } : session)));
+    }
+    showNotice('Charge removed.', {
+      label: 'Undo',
+      onClick: () => {
+        setCharges((current) => (current.some((charge) => charge.id === removed.id) ? current : [...current, removed]));
+        if (linkedSessionIds.length) {
+          setSessions((current) =>
+            current.map((session) => (linkedSessionIds.includes(session.id) ? { ...session, chargeId: removed.id } : session)),
+          );
+        }
+      },
+    });
+  }
+
   function completeSetup({ therapistName, practiceName, paymentDetails, currency, loadSample }) {
     setSettings((prev) => ({
       ...prev,
@@ -1212,6 +1247,9 @@ function App() {
                 charges={charges}
                 payments={payments}
                 allocation={allocation}
+                updateClient={updateClient}
+                updateCharge={updateCharge}
+                deleteCharge={deleteCharge}
                 clientTab={clientTab}
                 setClientTab={setClientTab}
                 clientDraft={clientDraft}
@@ -1839,8 +1877,10 @@ function SessionModal({ session, client, ledger, statusSession, undoSession, res
   );
 }
 
-function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessions, charges, payments, allocation, clientTab, setClientTab, clientDraft, setClientDraft, addClient, exportClientsCsv, exportJson, importCsv }) {
+function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessions, charges, payments, allocation, updateClient, updateCharge, deleteCharge, clientTab, setClientTab, clientDraft, setClientDraft, addClient, exportClientsCsv, exportJson, importCsv }) {
   const fileInputRef = useRef(null);
+  const [editingClient, setEditingClient] = useState(null);
+  const [editingCharge, setEditingCharge] = useState(null);
 
   function handleFile(event) {
     const file = event.target.files?.[0];
@@ -1862,6 +1902,7 @@ function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessio
   ].sort((a, b) => a.date.localeCompare(b.date));
 
   return (
+    <>
     <div className="grid gap-5 xl:grid-cols-[0.9fr_1.4fr]">
       <Panel>
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1929,8 +1970,14 @@ function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessio
               {selectedClient ? `${selectedClient.email} - ${selectedClient.phone}` : 'Add your first client with the form on the left.'}
             </p>
           </div>
-          <div className="flex flex-wrap gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             {(selectedClient?.tags || []).map((tag) => <span key={tag} className="rounded-md bg-[var(--panel-muted)] px-2 py-1 text-xs font-medium">{tag}</span>)}
+            {selectedClient && (
+              <button type="button" className="icon-button px-3 py-2 text-xs" onClick={() => setEditingClient(selectedClient)}>
+                <Pencil size={14} />
+                Edit
+              </button>
+            )}
           </div>
         </div>
         <Segmented className="mt-4" options={['Overview', 'Sessions', 'Financials', 'Timeline']} value={clientTab} onChange={setClientTab} />
@@ -1962,7 +2009,7 @@ function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessio
                   <p className="text-sm text-[var(--subtle)]">No charges for this client yet.</p>
                 ) : (
                   <SimpleTable
-                    headers={['Date', 'Reason', 'Amount', 'Paid', 'Balance', 'Status']}
+                    headers={['Date', 'Reason', 'Amount', 'Paid', 'Balance', 'Status', '']}
                     rows={selectedCharges
                       .slice()
                       .sort((a, b) => b.date.localeCompare(a.date))
@@ -1979,6 +2026,28 @@ function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessio
                           formatMoney(settled.paid),
                           formatMoney(settled.balance),
                           <ChargeStatusBadge key="s" status={settled.status} />,
+                          <div key="a" className="flex justify-end gap-1">
+                            <button
+                              type="button"
+                              className="rounded-md p-1.5 text-[var(--subtle)] hover:bg-[var(--panel-muted)] hover:text-[var(--text)]"
+                              onClick={() => setEditingCharge(charge)}
+                              title="Edit charge"
+                              aria-label="Edit charge"
+                            >
+                              <Pencil size={15} />
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded-md p-1.5 text-[var(--subtle)] hover:bg-[var(--panel-muted)] hover:text-[var(--accent)]"
+                              onClick={() => {
+                                if (window.confirm(`Remove this ${charge.reason} charge of ${formatMoney(charge.amount)}?`)) deleteCharge(charge.id);
+                              }}
+                              title="Remove charge"
+                              aria-label="Remove charge"
+                            >
+                              <Trash2 size={15} />
+                            </button>
+                          </div>,
                         ];
                       })}
                   />
@@ -2001,6 +2070,144 @@ function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessio
           )}
         </div>
       </Panel>
+    </div>
+    {editingClient && (
+      <ClientEditModal
+        client={editingClient}
+        onSave={updateClient}
+        onClose={() => setEditingClient(null)}
+      />
+    )}
+    {editingCharge && (
+      <ChargeEditModal
+        charge={editingCharge}
+        onSave={updateCharge}
+        onClose={() => setEditingCharge(null)}
+      />
+    )}
+    </>
+  );
+}
+
+function ClientEditModal({ client, onSave, onClose }) {
+  const [draft, setDraft] = useState(() => ({
+    ...client,
+    tags: Array.isArray(client.tags) ? client.tags.join(', ') : client.tags || '',
+  }));
+  const set = (patch) => setDraft((current) => ({ ...current, ...patch }));
+  const dayOptions = ['', ...WEEKDAYS];
+  const dayLabels = { '': '—' };
+
+  function submit(event) {
+    event.preventDefault();
+    if (!String(draft.name).trim()) return;
+    onSave({
+      ...draft,
+      name: String(draft.name).trim(),
+      sessionRate: Number(draft.sessionRate) || 0,
+      monthlyFee: Number(draft.monthlyFee) || 0,
+      duration: Number(draft.duration) || 60,
+      tags: String(draft.tags).split(',').map((tag) => tag.trim()).filter(Boolean),
+    });
+    onClose();
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
+      <form
+        className="max-h-[88vh] w-full max-w-2xl overflow-y-auto rounded-lg border border-[var(--line)] bg-[var(--panel)] p-5 shadow-soft"
+        onClick={(event) => event.stopPropagation()}
+        onSubmit={submit}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <h2 className="text-xl font-semibold">Edit {client.name || 'client'}</h2>
+          <button type="button" className="rounded-md p-1 text-[var(--subtle)] hover:bg-[var(--panel-muted)]" onClick={onClose} aria-label="Close">
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+          <Input label="Name" value={draft.name} onChange={(value) => set({ name: value })} />
+          <Select label="Status" value={draft.status} options={['Active', 'Archived']} onChange={(value) => set({ status: value })} />
+          <Input label="Email" value={draft.email || ''} onChange={(value) => set({ email: value })} />
+          <Input label="Phone" value={draft.phone || ''} onChange={(value) => set({ phone: value })} />
+          <Select label="Type" value={draft.type} options={['Individual', 'Group', 'Supervision']} onChange={(value) => set({ type: value })} />
+          <Select label="Billing Model" value={draft.billingModel} options={['Per Session', 'Subscription', 'Custom']} onChange={(value) => set({ billingModel: value })} />
+          <Input label="Session Rate" type="number" value={draft.sessionRate} onChange={(value) => set({ sessionRate: value })} />
+          <Input label="Monthly Fee" type="number" value={draft.monthlyFee} onChange={(value) => set({ monthlyFee: value })} />
+          <Select label="Collection Method" value={draft.collectionMethod} options={CLIENT_CSV_ENUMS.collectionMethod} onChange={(value) => set({ collectionMethod: value })} />
+          <Select label="Schedule Type" value={draft.scheduleType} options={['Recurring', 'Manual']} onChange={(value) => set({ scheduleType: value })} />
+          <Select label="Session Day" value={draft.day || ''} options={dayOptions} labels={dayLabels} onChange={(value) => set({ day: value })} />
+          <Input label="Session Time" type="time" value={draft.time || ''} onChange={(value) => set({ time: value })} />
+          <Select label="Session Day 2" value={draft.day2 || ''} options={dayOptions} labels={dayLabels} onChange={(value) => set({ day2: value })} />
+          <Input label="Session Time 2" type="time" value={draft.time2 || ''} onChange={(value) => set({ time2: value })} />
+          <Input label="Duration (min)" type="number" value={draft.duration} onChange={(value) => set({ duration: value })} />
+          <Select label="Reminder" value={draft.reminder} options={['WhatsApp', 'Email', 'Both', 'None']} onChange={(value) => set({ reminder: value })} />
+          <Select label="Cancellation Rule" value={draft.cancellationRule} options={['Use Practice Default', 'Custom']} onChange={(value) => set({ cancellationRule: value })} />
+          <Input label="Joining Date" type="date" value={draft.joiningDate || ''} onChange={(value) => set({ joiningDate: value })} />
+          <Input label="Tags (comma separated)" value={draft.tags} onChange={(value) => set({ tags: value })} />
+        </div>
+
+        <label className="mt-3 block">
+          <span className="text-sm font-medium text-[var(--subtle)]">Notes</span>
+          <textarea
+            value={draft.notes || ''}
+            onChange={(event) => set({ notes: event.target.value })}
+            rows={3}
+            className="mt-1 w-full rounded-md border border-[var(--line)] bg-[var(--panel)] px-3 py-2 text-sm text-[var(--text)]"
+          />
+        </label>
+
+        <div className="mt-5 flex justify-end gap-2">
+          <button type="button" className="icon-button" onClick={onClose}>Cancel</button>
+          <button type="submit" className="icon-button bg-[var(--primary)] text-white hover:bg-[var(--primary-dark)]">
+            <Check size={16} />
+            Save changes
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function ChargeEditModal({ charge, onSave, onClose }) {
+  const [date, setDate] = useState(charge.date);
+  const [amount, setAmount] = useState(charge.amount);
+  const [reason, setReason] = useState(charge.reason);
+
+  function submit(event) {
+    event.preventDefault();
+    if (!String(reason).trim() || Number(amount) <= 0) return;
+    onSave(charge.id, { date, amount: Number(amount), reason: String(reason).trim() });
+    onClose();
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
+      <form
+        className="w-full max-w-md rounded-lg border border-[var(--line)] bg-[var(--panel)] p-5 shadow-soft"
+        onClick={(event) => event.stopPropagation()}
+        onSubmit={submit}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <h2 className="text-xl font-semibold">Edit charge</h2>
+          <button type="button" className="rounded-md p-1 text-[var(--subtle)] hover:bg-[var(--panel-muted)]" onClick={onClose} aria-label="Close">
+            <X size={18} />
+          </button>
+        </div>
+        <div className="mt-4 grid gap-3">
+          <Input label="Date" type="date" value={date} onChange={setDate} />
+          <Input label="Amount" type="number" value={amount} onChange={setAmount} />
+          <Input label="Reason" value={reason} onChange={setReason} />
+        </div>
+        <div className="mt-5 flex justify-end gap-2">
+          <button type="button" className="icon-button" onClick={onClose}>Cancel</button>
+          <button type="submit" className="icon-button bg-[var(--primary)] text-white hover:bg-[var(--primary-dark)]">
+            <Check size={16} />
+            Save charge
+          </button>
+        </div>
+      </form>
     </div>
   );
 }
