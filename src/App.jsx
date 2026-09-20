@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   Archive,
   BarChart3,
   CalendarDays,
@@ -787,6 +788,53 @@ function allocateLedger(charges, payments) {
   return { byCharge, credit: Math.max(pool, 0) };
 }
 
+function timeToMinutes(time) {
+  const [h, m] = String(time || '').split(':').map(Number);
+  return (Number.isFinite(h) ? h : 0) * 60 + (Number.isFinite(m) ? m : 0);
+}
+
+// A session only occupies its slot if it will actually happen — a cancelled or
+// rescheduled session frees the time and can't clash with anything.
+function occupiesSlot(session) {
+  return session.status !== 'Cancelled' && session.status !== 'Rescheduled';
+}
+
+// Two sessions clash if they fall on the same date and their time ranges (start
+// through start + duration) overlap. A solo therapist can only be in one place.
+function sessionsClash(a, b) {
+  if (a.date !== b.date) return false;
+  const aStart = timeToMinutes(a.time);
+  const bStart = timeToMinutes(b.time);
+  return aStart < bStart + (Number(b.duration) || 60) && bStart < aStart + (Number(a.duration) || 60);
+}
+
+// Set of session ids that overlap at least one other occupying session. Grouped
+// by date so the pairwise scan stays tiny for a solo practice.
+function findConflicts(sessions) {
+  const byDate = {};
+  for (const session of sessions) {
+    if (occupiesSlot(session)) (byDate[session.date] ||= []).push(session);
+  }
+  const ids = new Set();
+  for (const list of Object.values(byDate)) {
+    for (let i = 0; i < list.length; i += 1) {
+      for (let j = i + 1; j < list.length; j += 1) {
+        if (sessionsClash(list[i], list[j])) {
+          ids.add(list[i].id);
+          ids.add(list[j].id);
+        }
+      }
+    }
+  }
+  return ids;
+}
+
+// The first existing occupying session a candidate {date,time,duration} would
+// clash with, skipping the session being moved. Null when the slot is free.
+function firstClash(sessions, candidate, ignoreId) {
+  return sessions.find((session) => session.id !== ignoreId && occupiesSlot(session) && sessionsClash(session, candidate)) || null;
+}
+
 function App() {
   const [activeNav, setActiveNav] = useState('Dashboard');
   const [view, setView] = useState('Today');
@@ -881,6 +929,10 @@ function App() {
     return { byCharge, openByClient };
   }, [clients, charges, payments]);
 
+  // Sessions that overlap another occupying session on the same day — surfaced
+  // on the dashboard and week view, and checked before adding or rescheduling.
+  const conflictIds = useMemo(() => findConflicts(sessions), [sessions]);
+
   const visibleSessions = useMemo(
     () => sessions.filter((session) => isInPeriod(session.date, view)).sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`)),
     [sessions, view],
@@ -960,6 +1012,14 @@ function App() {
   // Move a session to a chosen date/time: the original becomes a 'Rescheduled'
   // record and a fresh, sticky (never auto-pruned) session is created at the new
   // slot. Without an explicit date it defaults to one week ahead, same time.
+  // Human-readable warning naming the session a candidate slot would collide
+  // with, ending in the caller's verb (e.g. "Add anyway?", "Move anyway?").
+  function clashPrompt(clash, question) {
+    const other = clientById[clash.clientId];
+    const when = formatDate(clash.date, { weekday: 'short', day: '2-digit', month: 'short' });
+    return `This overlaps ${other?.name || 'another session'} at ${clash.time} on ${when}. ${question}`;
+  }
+
   function reschedule(sessionId, newDate, newTime) {
     const session = sessions.find((item) => item.id === sessionId);
     if (!session) return;
@@ -970,6 +1030,8 @@ function App() {
       date = fallback.toISOString().slice(0, 10);
     }
     const time = newTime || session.time;
+    const clash = firstClash(sessions, { date, time, duration: session.duration }, sessionId);
+    if (clash && !window.confirm(clashPrompt(clash, 'Move anyway?'))) return;
     const replacement = {
       ...session,
       id: `s${Date.now()}`,
@@ -1000,6 +1062,8 @@ function App() {
   function addSession(draft) {
     if (!draft.clientId || !draft.date || !draft.time) return false;
     const client = clientById[draft.clientId];
+    const clash = firstClash(sessions, { date: draft.date, time: draft.time, duration: Number(draft.duration) || 60 }, null);
+    if (clash && !window.confirm(clashPrompt(clash, 'Add anyway?'))) return false;
     setSessions((current) => [
       ...current,
       {
@@ -1209,6 +1273,7 @@ function App() {
                 sessions={visibleSessions}
                 clients={clientById}
                 ledgerByClient={ledgerByClient}
+                conflictIds={conflictIds}
                 stats={{
                   today: sessions.filter((session) => session.date === todayIso).length,
                   outstanding: totalOutstanding,
@@ -1230,6 +1295,7 @@ function App() {
                 sessions={sessions}
                 clients={clientById}
                 ledgerByClient={ledgerByClient}
+                conflictIds={conflictIds}
                 statusSession={statusSession}
                 undoSession={undoSession}
                 reschedule={reschedule}
@@ -1540,7 +1606,7 @@ function MobileNav({ activeNav, setActiveNav }) {
   );
 }
 
-function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient, stats, statusSession, undoSession, reschedule, removeSession, addSession, setPaymentDraft, setActiveNav }) {
+function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient, conflictIds, stats, statusSession, undoSession, reschedule, removeSession, addSession, setPaymentDraft, setActiveNav }) {
   const outstandingClients = Object.values(clients).filter((client) => ledgerByClient[client.id]?.outstanding > 0);
   const activeClients = Object.values(clients).filter((client) => client.status === 'Active');
   const [adding, setAdding] = useState(false);
@@ -1620,14 +1686,16 @@ function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient,
               const client = clients[session.clientId];
               if (!client) return null;
               const ledger = ledgerByClient[session.clientId];
+              const conflict = conflictIds?.has(session.id);
               return (
-                <article key={session.id} className="rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
+                <article key={session.id} className={`rounded-md border bg-[var(--bg)] p-4 ${conflict ? 'border-red-300' : 'border-[var(--line)]'}`}>
                   <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                     <div className="min-w-0">
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="text-sm font-semibold">{session.time}</span>
                         <span className="text-sm text-[var(--subtle)]">{formatDate(session.date, { weekday: 'short', day: '2-digit', month: 'short' })}</span>
                         <StatusBadge status={session.status} />
+                        {conflict && <ConflictBadge />}
                       </div>
                       <h4 className="mt-1 text-lg font-semibold">{client.name}</h4>
                       <p className="text-sm text-[var(--subtle)]">Outstanding {formatMoney(ledger?.outstanding || 0)}</p>
@@ -1711,7 +1779,7 @@ const STATUS_TONE = {
   Rescheduled: { chip: 'border-[var(--line)] bg-[var(--panel-muted)] opacity-70', dot: 'bg-[var(--subtle)]' },
 };
 
-function Schedule({ sessions, clients, ledgerByClient, statusSession, undoSession, reschedule, removeSession }) {
+function Schedule({ sessions, clients, ledgerByClient, conflictIds, statusSession, undoSession, reschedule, removeSession }) {
   const [weekStart, setWeekStart] = useState(() => startOfWeekIso(todayIso));
   const [modalSession, setModalSession] = useState(null);
 
@@ -1727,6 +1795,7 @@ function Schedule({ sessions, clients, ledgerByClient, statusSession, undoSessio
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessions, weekStart]);
 
+  const weekConflicts = days.reduce((count, iso) => count + byDay[iso].filter((session) => conflictIds?.has(session.id)).length, 0);
   const rangeLabel = `${formatDate(weekStart, { day: '2-digit', month: 'short' })} – ${formatDate(weekEnd, { day: '2-digit', month: 'short' })}`;
 
   return (
@@ -1736,6 +1805,12 @@ function Schedule({ sessions, clients, ledgerByClient, statusSession, undoSessio
           <div>
             <h3 className="section-title">Schedule</h3>
             <p className="section-subtitle">{rangeLabel} · tap a session to mark, reschedule or remove it.</p>
+            {weekConflicts > 0 && (
+              <p className="mt-1 inline-flex items-center gap-1 text-sm font-medium text-red-700">
+                <AlertTriangle size={14} />
+                {weekConflicts} overlapping session{weekConflicts === 1 ? '' : 's'} this week
+              </p>
+            )}
           </div>
           <div className="flex items-center gap-2">
             <button type="button" className="icon-button px-3 py-2 text-xs" onClick={() => setWeekStart(isoAddDays(weekStart, -7))} aria-label="Previous week">
@@ -1768,16 +1843,18 @@ function Schedule({ sessions, clients, ledgerByClient, statusSession, undoSessio
                     const client = clients[session.clientId];
                     if (!client) return null;
                     const tone = STATUS_TONE[session.status] || STATUS_TONE.Scheduled;
+                    const conflict = conflictIds?.has(session.id);
                     return (
                       <button
                         key={session.id}
                         type="button"
                         onClick={() => setModalSession(session)}
-                        className={`w-full rounded-md border px-2 py-1.5 text-left transition hover:brightness-95 ${tone.chip}`}
+                        className={`w-full rounded-md border px-2 py-1.5 text-left transition hover:brightness-95 ${tone.chip}${conflict ? ' ring-2 ring-red-400' : ''}`}
                       >
                         <span className="flex items-center gap-1.5">
                           <span className={`h-2 w-2 shrink-0 rounded-full ${tone.dot}`} />
                           <span className="text-xs font-semibold">{session.time}</span>
+                          {conflict && <AlertTriangle size={12} className="ml-auto shrink-0 text-red-600" />}
                         </span>
                         <span className="mt-0.5 block truncate text-sm font-medium">{client.name}</span>
                       </button>
@@ -2692,6 +2769,15 @@ function StatusBadge({ status }) {
 function ChargeStatusBadge({ status }) {
   const tone = CHARGE_STATUS_TONE[status] || CHARGE_STATUS_TONE.Pending;
   return <span className={`inline-block rounded-md border px-2 py-1 text-xs font-semibold ${tone}`}>{status}</span>;
+}
+
+function ConflictBadge() {
+  return (
+    <span className="inline-flex items-center gap-1 rounded-md border border-red-300 bg-red-50 px-2 py-1 text-xs font-semibold text-red-700">
+      <AlertTriangle size={13} />
+      Clash
+    </span>
+  );
 }
 
 function SmallAction({ icon: Icon, label, onClick, active = false }) {
