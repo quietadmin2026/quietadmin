@@ -1,0 +1,125 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color: #25312c;
+  background: #f7f4ee;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 3px solid rgba(76, 96, 83, 0.35);
+  outline-offset: 2px;
+}
+
+.theme-quiet-cream {
+  --bg: #f7f4ee;
+  --panel: #fffdfa;
+  --panel-muted: #eee8dc;
+  --text: #25312c;
+  --subtle: #69756c;
+  --line: #ded7c9;
+  --primary: #4c6053;
+  --primary-dark: #314039;
+  --accent: #b7794d;
+  --accent-soft: #f0ded0;
+}
+
+.theme-terracotta {
+  --bg: #f8f1ec;
+  --panel: #fffaf6;
+  --panel-muted: #f2dfd3;
+  --text: #352823;
+  --subtle: #7a665c;
+  --line: #e5cfc0;
+  --primary: #915b44;
+  --primary-dark: #5f3b2e;
+  --accent: #2f665d;
+  --accent-soft: #dcebe8;
+}
+
+.theme-sage {
+  --bg: #eff4ef;
+  --panel: #fbfffb;
+  --panel-muted: #dfe9df;
+  --text: #22312a;
+  --subtle: #66766c;
+  --line: #cfdccf;
+  --primary: #496953;
+  --primary-dark: #2f4637;
+  --accent: #a06d45;
+  --accent-soft: #f0e1d3;
+}
+
+.theme-slate {
+  --bg: #eef2f3;
+  --panel: #fcfefe;
+  --panel-muted: #dfe7e9;
+  --text: #1f2d33;
+  --subtle: #62747d;
+  --line: #cfdadd;
+  --primary: #435d68;
+  --primary-dark: #273a43;
+  --accent: #9b6a4b;
+  --accent-soft: #efded3;
+}
+
+.surface {
+  background: var(--panel);
+  border-color: var(--line);
+}
+
+.scrollbar-soft::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.scrollbar-soft::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 999px;
+}
+
+@layer components {
+  .icon-button {
+    @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition;
+    background: var(--panel);
+    border-color: var(--line);
+    color: var(--text);
+  }
+
+  .icon-button:hover {
+    background: var(--panel-muted);
+  }
+
+  .section-title {
+    @apply text-xl font-semibold;
+  }
+
+  .section-subtitle {
+    @apply mt-1 text-sm;
+    color: var(--subtle);
+  }
+}
