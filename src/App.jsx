@@ -641,6 +641,87 @@ function isInPeriod(date, view) {
   return target.getFullYear() === start.getFullYear() && target.getMonth() === start.getMonth();
 }
 
+// How far ahead recurring clients' weekly slots are materialized into sessions.
+const RECURRING_HORIZON_DAYS = 28;
+const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+function isoOf(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function isoAddDays(iso, days) {
+  const d = toDate(iso);
+  d.setDate(d.getDate() + days);
+  return isoOf(d);
+}
+
+// A recurring client's weekly slots: the primary day/time and an optional second.
+function clientSlots(client) {
+  const slots = [];
+  if (client.day && client.time) slots.push({ day: client.day, time: client.time });
+  if (client.day2 && client.time2) slots.push({ day: client.day2, time: client.time2 });
+  return slots;
+}
+
+// Keep the session list in sync with clients' recurring schedules:
+//   - materialize any missing weekly slots from today through the horizon,
+//   - remove app-generated, still-Scheduled, future sessions that no longer
+//     match a valid slot (client archived, made manual, or their day/time moved).
+// Only ever touches `auto` sessions that the therapist hasn't acted on; manual
+// sessions, past sessions, and anything marked (Present/Cancelled/…) are left
+// untouched. Returns the same array reference when nothing changes so callers
+// can skip a state update. Session ids are deterministic per (client, date,
+// time) so two devices generating the same slot never create a duplicate.
+function reconcileRecurringSessions(clients, sessions) {
+  const horizonEnd = isoAddDays(todayIso, RECURRING_HORIZON_DAYS);
+  const clientById = Object.fromEntries(clients.map((client) => [client.id, client]));
+
+  const kept = sessions.filter((session) => {
+    const stale = session.auto && session.status === 'Scheduled' && session.date >= todayIso;
+    if (!stale) return true;
+    const client = clientById[session.clientId];
+    if (!client || client.status !== 'Active' || client.scheduleType !== 'Recurring') return false;
+    return clientSlots(client).some(
+      (slot) => slot.time === session.time && WEEKDAYS[toDate(session.date).getDay()] === slot.day,
+    );
+  });
+
+  const existing = new Set(kept.map((session) => `${session.clientId}|${session.date}|${session.time}`));
+  const additions = [];
+  for (const client of clients) {
+    if (client.status !== 'Active' || client.scheduleType !== 'Recurring') continue;
+    const startIso =
+      ISO_DATE.test(client.joiningDate || '') && client.joiningDate > todayIso ? client.joiningDate : todayIso;
+    for (const slot of clientSlots(client)) {
+      const targetDow = WEEKDAYS.indexOf(slot.day);
+      if (targetDow < 0) continue;
+      const cursor = toDate(startIso);
+      while (cursor.getDay() !== targetDow) cursor.setDate(cursor.getDate() + 1);
+      for (; ; cursor.setDate(cursor.getDate() + 7)) {
+        const iso = isoOf(cursor);
+        if (iso > horizonEnd) break;
+        const key = `${client.id}|${iso}|${slot.time}`;
+        if (existing.has(key)) continue;
+        existing.add(key);
+        additions.push({
+          id: `auto-${client.id}-${iso}-${slot.time}`,
+          clientId: client.id,
+          date: iso,
+          time: slot.time,
+          duration: Number(client.duration) || 60,
+          status: 'Scheduled',
+          chargeId: null,
+          auto: true,
+        });
+      }
+    }
+  }
+
+  if (additions.length === 0 && kept.length === sessions.length) return sessions;
+  return kept.concat(additions);
+}
+
 function App() {
   const [activeNav, setActiveNav] = useState('Dashboard');
   const [view, setView] = useState('Today');
@@ -688,6 +769,14 @@ function App() {
   }, []);
 
   const clientById = useMemo(() => Object.fromEntries(clients.map((client) => [client.id, client])), [clients]);
+
+  // Keep upcoming sessions materialized from each recurring client's weekly
+  // schedule. Runs on mount and whenever clients change (add, edit a day/time,
+  // archive); reads the latest sessions via the functional update so it never
+  // needs `sessions` in its deps and can't loop. reconcile is idempotent.
+  useEffect(() => {
+    setSessions((current) => reconcileRecurringSessions(clients, current));
+  }, [clients, setSessions]);
 
   const ledgers = useMemo(() => {
     return clients.map((client) => {
@@ -791,11 +880,31 @@ function App() {
       date: nextDate.toISOString().slice(0, 10),
       status: 'Scheduled',
       chargeId: null,
+      auto: false, // a rescheduled slot is a therapist action — never auto-pruned
     };
     setSessions((current) =>
       current.map((item) => (item.id === sessionId ? { ...item, status: 'Rescheduled' } : item)).concat(replacement),
     );
     showNotice('Replacement session created one week ahead.');
+  }
+
+  function addSession(draft) {
+    if (!draft.clientId || !draft.date || !draft.time) return false;
+    const client = clientById[draft.clientId];
+    setSessions((current) => [
+      ...current,
+      {
+        id: `s${Date.now()}`,
+        clientId: draft.clientId,
+        date: draft.date,
+        time: draft.time,
+        duration: Number(draft.duration) || 60,
+        status: 'Scheduled',
+        chargeId: null,
+      },
+    ]);
+    showNotice(`Session added for ${client?.name || 'client'}.`);
+    return true;
   }
 
   function recordPayment(event) {
@@ -965,6 +1074,7 @@ function App() {
                 statusSession={statusSession}
                 undoSession={undoSession}
                 reschedule={reschedule}
+                addSession={addSession}
                 setPaymentDraft={setPaymentDraft}
                 setActiveNav={setActiveNav}
               />
@@ -1267,8 +1377,21 @@ function MobileNav({ activeNav, setActiveNav }) {
   );
 }
 
-function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient, stats, statusSession, undoSession, reschedule, setPaymentDraft, setActiveNav }) {
+function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient, stats, statusSession, undoSession, reschedule, addSession, setPaymentDraft, setActiveNav }) {
   const outstandingClients = Object.values(clients).filter((client) => ledgerByClient[client.id]?.outstanding > 0);
+  const activeClients = Object.values(clients).filter((client) => client.status === 'Active');
+  const [adding, setAdding] = useState(false);
+  const [draft, setDraft] = useState({ clientId: '', date: todayIso, time: '10:00', duration: 60 });
+
+  function submitSession(event) {
+    event.preventDefault();
+    const clientId = draft.clientId || activeClients[0]?.id || '';
+    if (addSession({ ...draft, clientId })) {
+      setAdding(false);
+      setDraft({ clientId: '', date: todayIso, time: '10:00', duration: 60 });
+    }
+  }
+
   return (
     <div className="space-y-5">
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -1283,13 +1406,55 @@ function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient,
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <h3 className="section-title">Sessions</h3>
-              <p className="section-subtitle">Auto charge is {settings.autoCreateCharges ? 'on' : 'off'}.</p>
+              <p className="section-subtitle">Recurring clients fill in automatically. Auto charge is {settings.autoCreateCharges ? 'on' : 'off'}.</p>
             </div>
-            <Segmented options={['Today', 'Week', 'Month']} value={view} onChange={setView} />
+            <div className="flex flex-wrap items-center gap-2">
+              <Segmented options={['Today', 'Week', 'Month']} value={view} onChange={setView} />
+              <button
+                type="button"
+                className={`icon-button px-3 py-2 text-xs${adding ? ' is-active' : ''}`}
+                onClick={() => setAdding((open) => !open)}
+              >
+                <Plus size={15} />
+                Add session
+              </button>
+            </div>
           </div>
+
+          {adding && (
+            <form onSubmit={submitSession} className="mt-4 grid gap-3 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4 sm:grid-cols-2">
+              {activeClients.length === 0 ? (
+                <p className="text-sm text-[var(--subtle)] sm:col-span-2">Add an active client first, then you can schedule a session.</p>
+              ) : (
+                <>
+                  <Select
+                    label="Client"
+                    value={draft.clientId || activeClients[0].id}
+                    options={activeClients.map((client) => client.id)}
+                    labels={Object.fromEntries(activeClients.map((client) => [client.id, client.name]))}
+                    onChange={(value) => setDraft((current) => ({ ...current, clientId: value }))}
+                  />
+                  <Input label="Date" type="date" value={draft.date} onChange={(value) => setDraft((current) => ({ ...current, date: value }))} />
+                  <Input label="Time" type="time" value={draft.time} onChange={(value) => setDraft((current) => ({ ...current, time: value }))} />
+                  <Input label="Duration (min)" type="number" value={draft.duration} onChange={(value) => setDraft((current) => ({ ...current, duration: value }))} />
+                  <div className="flex gap-2 sm:col-span-2">
+                    <button type="submit" className="rounded-md bg-[var(--primary)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--primary-dark)]">Add session</button>
+                    <button type="button" className="icon-button px-4 py-2 text-sm" onClick={() => setAdding(false)}>Cancel</button>
+                  </div>
+                </>
+              )}
+            </form>
+          )}
+
           <div className="mt-4 space-y-3">
+            {sessions.length === 0 && (
+              <p className="rounded-md border border-dashed border-[var(--line)] bg-[var(--bg)] px-4 py-6 text-center text-sm text-[var(--subtle)]">
+                No sessions for {view === 'Today' ? 'today' : `this ${view.toLowerCase()}`}. Recurring clients appear here automatically, or use Add session.
+              </p>
+            )}
             {sessions.map((session) => {
               const client = clients[session.clientId];
+              if (!client) return null;
               const ledger = ledgerByClient[session.clientId];
               return (
                 <article key={session.id} className="rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
