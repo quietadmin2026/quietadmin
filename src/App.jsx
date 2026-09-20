@@ -40,19 +40,19 @@ const currency = new Intl.NumberFormat('en-IN', {
 const todayIso = '2026-06-10';
 
 const initialSettings = {
-  therapistName: 'Arushi',
-  practiceName: 'Quiet Room Therapy',
-  paymentDetails: 'UPI: arushi@okicici',
+  therapistName: '',
+  practiceName: '',
+  paymentDetails: '',
   autoCreateCharges: true,
   lateCancellationHours: 24,
   lateCancellationCharge: 100,
   monthlyStatements: true,
   outstandingReminders: true,
   theme: 'Quiet Cream',
-  onboarded: false,
+  profileComplete: false,
 };
 
-const initialClients = [
+const SAMPLE_CLIENTS = [
   {
     id: 'c1',
     name: 'Meera Shah',
@@ -137,7 +137,7 @@ const initialClients = [
   },
 ];
 
-const initialGroups = [
+const SAMPLE_GROUPS = [
   {
     id: 'g1',
     name: 'Anxiety Skills Circle',
@@ -164,7 +164,7 @@ const initialGroups = [
   },
 ];
 
-const initialSessions = [
+const SAMPLE_SESSIONS = [
   { id: 's1', clientId: 'c1', date: '2026-06-10', time: '10:00', duration: 60, status: 'Scheduled', chargeId: null },
   { id: 's2', clientId: 'c2', date: '2026-06-10', time: '12:00', duration: 60, status: 'Scheduled', chargeId: null },
   { id: 's3', clientId: 'c3', date: '2026-06-10', time: '15:30', duration: 50, status: 'Late Cancel', chargeId: 'ch3' },
@@ -175,14 +175,14 @@ const initialSessions = [
   { id: 's8', clientId: 'c2', date: '2026-06-24', time: '12:00', duration: 60, status: 'Scheduled', chargeId: null },
 ];
 
-const initialCharges = [
+const SAMPLE_CHARGES = [
   { id: 'ch1', clientId: 'c1', date: '2026-06-03', amount: 2500, reason: 'Session Fee', status: 'Paid' },
   { id: 'ch2', clientId: 'c2', date: '2026-06-01', amount: 12000, reason: 'Subscription Fee', status: 'Partially Paid' },
   { id: 'ch3', clientId: 'c3', date: '2026-06-10', amount: 1500, reason: 'Late Cancellation', status: 'Pending' },
   { id: 'ch4', clientId: 'c1', date: '2026-05-28', amount: 2500, reason: 'Session Fee', status: 'Pending' },
 ];
 
-const initialPayments = [
+const SAMPLE_PAYMENTS = [
   { id: 'p1', clientId: 'c1', date: '2026-06-05', amount: 2000, method: 'UPI', reference: 'UPI-2048', notes: 'Partial payment' },
   { id: 'p2', clientId: 'c2', date: '2026-06-02', amount: 8000, method: 'Bank Transfer', reference: 'NEFT-991', notes: 'June subscription part payment' },
   { id: 'p3', clientId: 'c3', date: '2026-05-31', amount: 6000, method: 'UPI', reference: 'UPI-1180', notes: 'Advance deposit' },
@@ -615,11 +615,11 @@ function App() {
   const [activeNav, setActiveNav] = useState('Dashboard');
   const [view, setView] = useState('Today');
   const [settings, setSettings] = usePersistentState('settings', initialSettings);
-  const [clients, setClients] = usePersistentState('clients', initialClients);
-  const [groups, setGroups] = usePersistentState('groups', initialGroups);
-  const [sessions, setSessions] = usePersistentState('sessions', initialSessions);
-  const [charges, setCharges] = usePersistentState('charges', initialCharges);
-  const [payments, setPayments] = usePersistentState('payments', initialPayments);
+  const [clients, setClients] = usePersistentState('clients', []);
+  const [groups, setGroups] = usePersistentState('groups', []);
+  const [sessions, setSessions] = usePersistentState('sessions', []);
+  const [charges, setCharges] = usePersistentState('charges', []);
+  const [payments, setPayments] = usePersistentState('payments', []);
   const [selectedClientId, setSelectedClientId] = useState('c1');
   const [clientTab, setClientTab] = useState('Overview');
   const [paymentDraft, setPaymentDraft] = useState({ clientId: 'c1', amount: 2500, method: 'UPI', reference: '', notes: '' });
@@ -634,9 +634,11 @@ function App() {
 
   const applyRemote = useCallback((remote) => {
     if (remote.settings && typeof remote.settings === 'object' && !Array.isArray(remote.settings)) {
-      // A settings file already on Drive means this therapist has set up before,
-      // so treat them as onboarded even if the file predates the onboarded flag.
-      setSettings({ ...initialSettings, ...remote.settings, onboarded: true });
+      const merged = { ...initialSettings, ...remote.settings };
+      // A therapist who already has a name saved on Drive has set up before,
+      // so mark the profile complete even if the file predates the flag.
+      const hasProfile = Boolean((merged.therapistName || '').trim()) || remote.settings.profileComplete === true;
+      setSettings({ ...merged, profileComplete: hasProfile });
     }
     if (Array.isArray(remote.clients)) setClients(remote.clients);
     if (Array.isArray(remote.groups)) setGroups(remote.groups);
@@ -646,6 +648,13 @@ function App() {
   }, [setSettings, setClients, setGroups, setSessions, setCharges, setPayments]);
 
   const drive = useGoogleDrive({ clientId: GOOGLE_CLIENT_ID, data: driveData, applyRemote });
+
+  // Returning, already-set-up user: refresh the session in the background so the
+  // app opens instantly from cache and syncs when silent auth succeeds.
+  useEffect(() => {
+    if (settings.profileComplete && drive.configured) drive.trySilent();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const clientById = useMemo(() => Object.fromEntries(clients.map((client) => [client.id, client])), [clients]);
 
@@ -776,44 +785,47 @@ function App() {
     showNotice('Client added.');
   }
 
-  function completeOnboarding({ therapistName, practiceName, paymentDetails, startEmpty }) {
+  function completeSetup({ therapistName, practiceName, paymentDetails, loadSample }) {
     setSettings((prev) => ({
       ...prev,
-      therapistName: therapistName.trim() || prev.therapistName,
-      practiceName: practiceName.trim() || prev.practiceName,
+      therapistName: therapistName.trim(),
+      practiceName: practiceName.trim(),
       paymentDetails: paymentDetails.trim(),
-      onboarded: true,
+      profileComplete: true,
     }));
-    if (startEmpty) {
-      setClients([]);
-      setGroups([]);
-      setSessions([]);
-      setCharges([]);
-      setPayments([]);
-      setSelectedClientId('');
+    if (loadSample) {
+      setClients(SAMPLE_CLIENTS);
+      setGroups(SAMPLE_GROUPS);
+      setSessions(SAMPLE_SESSIONS);
+      setCharges(SAMPLE_CHARGES);
+      setPayments(SAMPLE_PAYMENTS);
+      setSelectedClientId(SAMPLE_CLIENTS[0].id);
     }
     showNotice('Welcome to QuietAdmin.');
   }
 
-  function skipOnboarding() {
-    setSettings((prev) => ({ ...prev, onboarded: true }));
-  }
-
-  function resetData() {
-    if (!window.confirm('Reset all data back to the demo seed? This clears everything saved in this browser.')) return;
+  function signOut() {
+    if (!window.confirm('Sign out? Your data stays safe in Google Drive. This device will sign in again to reload it.')) return;
+    drive.disconnect();
     STORAGE_KEYS.forEach((key) => {
       try {
         window.localStorage.removeItem(`${STORAGE_PREFIX}${key}`);
       } catch {
-        // Ignore removal failures.
+        // Ignore removal failures; reload still returns to the sign-in screen.
       }
     });
-    setSettings(initialSettings);
-    setClients(initialClients);
-    setSessions(initialSessions);
-    setCharges(initialCharges);
-    setPayments(initialPayments);
-    showNotice('Data reset to demo seed.');
+    window.location.reload();
+  }
+
+  function loadSampleData() {
+    if (!window.confirm('Load sample clients and data? This replaces your current clients, groups, sessions, charges and payments.')) return;
+    setClients(SAMPLE_CLIENTS);
+    setGroups(SAMPLE_GROUPS);
+    setSessions(SAMPLE_SESSIONS);
+    setCharges(SAMPLE_CHARGES);
+    setPayments(SAMPLE_PAYMENTS);
+    setSelectedClientId(SAMPLE_CLIENTS[0].id);
+    showNotice('Sample data loaded.');
   }
 
   function exportJson() {
@@ -836,9 +848,22 @@ function App() {
     setImportResult({ imported: accepted.length, skipped, error });
   }
 
+  const gate = settings.profileComplete ? 'app' : drive.signedIn ? 'setup' : 'signin';
+
+  if (gate !== 'app') {
+    return (
+      <main className={`${themeClass[settings.theme]} min-h-screen bg-[var(--bg)] text-[var(--text)]`}>
+        {gate === 'signin' ? (
+          <SignInScreen drive={drive} />
+        ) : (
+          <SetupScreen drive={drive} onComplete={completeSetup} />
+        )}
+      </main>
+    );
+  }
+
   return (
     <main className={`${themeClass[settings.theme]} min-h-screen bg-[var(--bg)] text-[var(--text)]`}>
-      {!settings.onboarded && <Onboarding onComplete={completeOnboarding} onSkip={skipOnboarding} drive={drive} />}
       {importResult && <ImportSummary result={importResult} onClose={() => setImportResult(null)} />}
       <div className="flex min-h-screen">
         <aside className="hidden w-72 shrink-0 border-r border-[var(--line)] bg-[var(--panel)] px-5 py-6 lg:block">
@@ -958,7 +983,7 @@ function App() {
               />
             )}
 
-            {activeNav === 'Settings' && <SettingsScreen settings={settings} setSettings={setSettings} resetData={resetData} />}
+            {activeNav === 'Settings' && <SettingsScreen settings={settings} setSettings={setSettings} loadSampleData={loadSampleData} signOut={signOut} drive={drive} />}
           </div>
         </section>
       </div>
@@ -966,28 +991,61 @@ function App() {
   );
 }
 
-function Onboarding({ onComplete, onSkip, drive }) {
-  const [therapistName, setTherapistName] = useState('');
+function SignInScreen({ drive }) {
+  const busy = drive.status === 'connecting' || drive.status === 'syncing';
+  return (
+    <div className="flex min-h-screen items-center justify-center p-4">
+      <div className="w-full max-w-md rounded-lg border border-[var(--line)] bg-[var(--panel)] p-6 text-center shadow-soft sm:p-8">
+        <div className="mx-auto grid h-14 w-14 place-items-center rounded-md bg-[var(--primary)] text-white">
+          <ReceiptText size={28} />
+        </div>
+        <h1 className="mt-4 text-2xl font-semibold">QuietAdmin</h1>
+        <p className="mt-1 text-sm text-[var(--subtle)]">The admin assistant for therapists.</p>
+        <p className="mt-5 text-sm text-[var(--subtle)]">
+          Sign in with Google to manage your practice. Your data is stored privately in your own Google Drive.
+        </p>
+        <button
+          type="button"
+          className="mt-6 icon-button w-full justify-center bg-[var(--primary)] text-white hover:bg-[var(--primary-dark)] disabled:opacity-50"
+          onClick={drive.connect}
+          disabled={busy || !drive.configured}
+        >
+          <Mail size={18} />
+          {busy ? 'Signing in…' : 'Sign in with Google'}
+        </button>
+        {!drive.configured && (
+          <p className="mt-3 text-xs text-[var(--accent)]">Google sign-in isn’t configured (missing VITE_GOOGLE_CLIENT_ID).</p>
+        )}
+        {drive.error && <p className="mt-3 text-xs text-[var(--accent)]">{drive.error}</p>}
+      </div>
+    </div>
+  );
+}
+
+function SetupScreen({ drive, onComplete }) {
+  const [therapistName, setTherapistName] = useState(drive.name || '');
   const [practiceName, setPracticeName] = useState('');
   const [paymentDetails, setPaymentDetails] = useState('');
-  const [startEmpty, setStartEmpty] = useState(true);
+  const [loadSample, setLoadSample] = useState(false);
 
   function submit(event) {
     event.preventDefault();
     if (!therapistName.trim()) return;
-    onComplete({ therapistName, practiceName, paymentDetails, startEmpty });
+    onComplete({ therapistName, practiceName, paymentDetails, loadSample });
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-      <div className="max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-lg border border-[var(--line)] bg-[var(--panel)] p-5 shadow-soft sm:p-6">
+    <div className="flex min-h-screen items-center justify-center p-4">
+      <div className="max-h-[94vh] w-full max-w-lg overflow-y-auto rounded-lg border border-[var(--line)] bg-[var(--panel)] p-6 shadow-soft sm:p-8">
         <div className="flex items-center gap-3">
           <div className="grid h-10 w-10 place-items-center rounded-md bg-[var(--primary)] text-white">
             <ReceiptText size={21} />
           </div>
           <div>
-            <h2 className="text-2xl font-semibold">Welcome to QuietAdmin</h2>
-            <p className="text-sm text-[var(--subtle)]">Let’s personalise your workspace. You can change any of this later in Settings.</p>
+            <h2 className="text-2xl font-semibold">Set up your practice</h2>
+            <p className="text-sm text-[var(--subtle)]">
+              {drive.email ? `Signed in as ${drive.email}. ` : ''}A few details to get started — you can change these later in Settings.
+            </p>
           </div>
         </div>
 
@@ -995,17 +1053,10 @@ function Onboarding({ onComplete, onSkip, drive }) {
           <Input label="Your name" value={therapistName} onChange={setTherapistName} />
           <Input label="Practice name" value={practiceName} onChange={setPracticeName} />
           <Input label="Payment details (UPI / bank) — optional" value={paymentDetails} onChange={setPaymentDetails} />
-          <div className="rounded-md border border-[var(--line)] bg-[var(--bg)] p-3">
-            <p className="text-sm font-medium">Starting point</p>
-            <label className="mt-2 flex items-center gap-2 text-sm">
-              <input type="radio" name="seed" className="accent-[var(--primary)]" checked={startEmpty} onChange={() => setStartEmpty(true)} />
-              Start with an empty workspace
-            </label>
-            <label className="mt-1 flex items-center gap-2 text-sm">
-              <input type="radio" name="seed" className="accent-[var(--primary)]" checked={!startEmpty} onChange={() => setStartEmpty(false)} />
-              Keep sample clients to explore first
-            </label>
-          </div>
+          <label className="flex items-center gap-2 rounded-md border border-[var(--line)] bg-[var(--bg)] p-3 text-sm">
+            <input type="checkbox" className="h-4 w-4 accent-[var(--primary)]" checked={loadSample} onChange={(event) => setLoadSample(event.target.checked)} />
+            Load sample clients so I can explore first
+          </label>
           <button
             type="submit"
             className="icon-button justify-center bg-[var(--primary)] text-white hover:bg-[var(--primary-dark)] disabled:opacity-50"
@@ -1014,21 +1065,6 @@ function Onboarding({ onComplete, onSkip, drive }) {
             Get started
           </button>
         </form>
-
-        <div className="mt-4 border-t border-[var(--line)] pt-4">
-          <p className="text-sm text-[var(--subtle)]">Already using QuietAdmin on another device?</p>
-          <div className="mt-2 flex flex-wrap items-center gap-3">
-            {drive.configured && (
-              <button type="button" className="icon-button" onClick={drive.connect}>
-                <Cloud size={16} />
-                Connect Google Drive to restore
-              </button>
-            )}
-            <button type="button" className="text-sm text-[var(--subtle)] underline" onClick={onSkip}>
-              Skip for now
-            </button>
-          </div>
-        </div>
       </div>
     </div>
   );
@@ -1124,34 +1160,34 @@ function TopBar({ settings, exportJson, drive }) {
 }
 
 function DriveButton({ drive }) {
-  const { status, email, lastSyncedAt, connect, disconnect } = drive;
+  const { status, signedIn, lastSyncedAt, connect } = drive;
 
-  if (status === 'connected' || status === 'syncing') {
-    const syncedLabel =
-      status === 'syncing'
-        ? 'Syncing…'
-        : lastSyncedAt
-          ? `Synced ${new Date(lastSyncedAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}`
-          : 'Synced';
+  if (status === 'connecting' || status === 'syncing') {
     return (
-      <div className="flex items-center gap-2">
-        <span className="inline-flex items-center gap-2 rounded-md border border-[var(--line)] bg-[var(--accent-soft)] px-3 py-2 text-sm font-medium text-[var(--primary-dark)]" title={email}>
-          <Cloud size={17} />
-          <span className="max-w-[10rem] truncate">{email || 'Google Drive'}</span>
-          <span className="text-[var(--subtle)]">· {syncedLabel}</span>
-        </span>
-        <button className="icon-button px-3 py-2" type="button" onClick={disconnect} title="Disconnect Google Drive">
-          <LogOut size={16} />
-        </button>
-      </div>
+      <span className="inline-flex items-center gap-2 rounded-md border border-[var(--line)] bg-[var(--accent-soft)] px-3 py-2 text-sm font-medium text-[var(--primary-dark)]">
+        <Cloud size={17} />
+        Syncing…
+      </span>
     );
   }
 
-  const connecting = status === 'connecting';
+  if (signedIn && status === 'connected') {
+    const syncedLabel = lastSyncedAt
+      ? `Synced ${new Date(lastSyncedAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}`
+      : 'Synced';
+    return (
+      <span className="inline-flex items-center gap-2 rounded-md border border-[var(--line)] bg-[var(--accent-soft)] px-3 py-2 text-sm font-medium text-[var(--primary-dark)]">
+        <Cloud size={17} />
+        {syncedLabel}
+      </span>
+    );
+  }
+
+  // Cached/offline: data is safe locally, but not syncing until re-auth.
   return (
-    <button className="icon-button" type="button" onClick={connect} disabled={connecting} title="Connect Google Drive">
-      {status === 'error' ? <CloudOff size={17} /> : <Mail size={17} />}
-      {connecting ? 'Connecting…' : 'Connect Google Drive'}
+    <button className="icon-button" type="button" onClick={connect} title="Sign in to sync with Google Drive">
+      <CloudOff size={17} />
+      Sign in to sync
     </button>
   );
 }
@@ -1635,7 +1671,7 @@ function Reports({ stats, exportJson }) {
   );
 }
 
-function SettingsScreen({ settings, setSettings, resetData }) {
+function SettingsScreen({ settings, setSettings, loadSampleData, signOut, drive }) {
   return (
     <div className="grid gap-5 xl:grid-cols-2">
       <Panel>
@@ -1647,12 +1683,22 @@ function SettingsScreen({ settings, setSettings, resetData }) {
           <Select label="Theme" value={settings.theme} options={['Quiet Cream', 'Terracotta', 'Sage', 'Slate']} onChange={(value) => setSettings({ ...settings, theme: value })} />
         </div>
         <div className="mt-5 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
-          <p className="text-sm font-semibold">Local data</p>
-          <p className="mt-1 text-sm text-[var(--subtle)]">Saved in this browser and restored on refresh. Reset to return to the demo seed.</p>
-          <button className="mt-3 icon-button" type="button" onClick={resetData}>
-            <RefreshCcw size={17} />
-            Reset demo data
-          </button>
+          <p className="text-sm font-semibold">Account &amp; data</p>
+          <p className="mt-1 text-sm text-[var(--subtle)]">
+            {drive?.signedIn ? `Signed in as ${drive.email}. ` : ''}Data is stored in your own Google Drive and cached in this browser.
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button className="icon-button" type="button" onClick={loadSampleData}>
+              <RefreshCcw size={17} />
+              Load sample data
+            </button>
+            {drive?.signedIn && (
+              <button className="icon-button" type="button" onClick={signOut}>
+                <LogOut size={17} />
+                Sign out
+              </button>
+            )}
+          </div>
         </div>
       </Panel>
       <Panel>

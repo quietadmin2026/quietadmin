@@ -84,16 +84,16 @@ async function driveFetch(url, token, options = {}) {
   return response;
 }
 
-async function fetchUserEmail(token) {
+async function fetchUserProfile(token) {
   try {
     const response = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
       headers: { Authorization: `Bearer ${token}` },
     });
-    if (!response.ok) return '';
+    if (!response.ok) return { email: '', name: '' };
     const json = await response.json();
-    return json.email || '';
+    return { email: json.email || '', name: json.given_name || json.name || '' };
   } catch {
-    return '';
+    return { email: '', name: '' };
   }
 }
 
@@ -168,6 +168,8 @@ async function updateFile(token, fileId, content) {
 export function useGoogleDrive({ clientId, data, applyRemote }) {
   const [status, setStatus] = useState('disconnected'); // disconnected | connecting | syncing | connected | error
   const [email, setEmail] = useState('');
+  const [name, setName] = useState('');
+  const [signedIn, setSignedIn] = useState(false);
   const [error, setError] = useState('');
   const [lastSyncedAt, setLastSyncedAt] = useState(null);
 
@@ -198,19 +200,24 @@ export function useGoogleDrive({ clientId, data, applyRemote }) {
     [clientId],
   );
 
-  const connect = useCallback(async () => {
+  const doConnect = useCallback(async (silent) => {
     if (!clientId) {
-      setError('Add a Google Client ID (VITE_GOOGLE_CLIENT_ID) to enable Drive sync.');
-      setStatus('error');
-      return;
+      if (!silent) {
+        setError('Add a Google Client ID (VITE_GOOGLE_CLIENT_ID) to enable Drive sync.');
+        setStatus('error');
+      }
+      return false;
     }
     setError('');
-    setStatus('connecting');
+    setStatus(silent ? 'syncing' : 'connecting');
     try {
       await loadGisScript();
-      const token = await requestToken(clientId, false);
+      const token = await requestToken(clientId, silent);
       tokenRef.current = token;
-      setEmail(await fetchUserEmail(token));
+      const profile = await fetchUserProfile(token);
+      setEmail(profile.email);
+      setName(profile.name);
+      setSignedIn(true);
 
       setStatus('syncing');
       let folderId = await findFolder(token);
@@ -261,12 +268,22 @@ export function useGoogleDrive({ clientId, data, applyRemote }) {
       readyRef.current = true;
       setLastSyncedAt(Date.now());
       setStatus('connected');
+      return true;
     } catch (err) {
-      setStatus('error');
-      setError(err.message || 'Could not connect to Google Drive.');
       readyRef.current = false;
+      if (silent) {
+        // Quiet failure: app keeps running from the local cache; user can reconnect.
+        setStatus('disconnected');
+      } else {
+        setStatus('error');
+        setError(err.message || 'Could not connect to Google Drive.');
+      }
+      return false;
     }
   }, [applyRemote, clientId]);
+
+  const connect = useCallback(() => doConnect(false), [doConnect]);
+  const trySilent = useCallback(() => doConnect(true), [doConnect]);
 
   const disconnect = useCallback(() => {
     const token = tokenRef.current;
@@ -283,6 +300,8 @@ export function useGoogleDrive({ clientId, data, applyRemote }) {
     snapshotRef.current = {};
     readyRef.current = false;
     setEmail('');
+    setName('');
+    setSignedIn(false);
     setError('');
     setLastSyncedAt(null);
     setStatus('disconnected');
@@ -315,5 +334,5 @@ export function useGoogleDrive({ clientId, data, applyRemote }) {
     return () => window.clearTimeout(handle);
   }, [serialized, status, withFreshToken]);
 
-  return { status, email, error, lastSyncedAt, connect, disconnect, configured: Boolean(clientId) };
+  return { status, email, name, signedIn, error, lastSyncedAt, connect, trySilent, disconnect, configured: Boolean(clientId) };
 }
