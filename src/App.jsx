@@ -897,7 +897,7 @@ function App() {
         <section className="min-w-0 flex-1">
           <MobileNav activeNav={activeNav} setActiveNav={setActiveNav} />
           <div className="mx-auto max-w-7xl px-4 py-5 sm:px-6 lg:px-8">
-            <TopBar settings={settings} exportJson={exportJson} drive={drive} />
+            <TopBar settings={settings} drive={drive} signOut={signOut} />
             {notice && <div className="mb-4 rounded-md bg-[var(--primary)] px-4 py-3 text-sm font-medium text-white shadow-soft">{notice}</div>}
 
             {activeNav === 'Dashboard' && (
@@ -983,7 +983,7 @@ function App() {
               />
             )}
 
-            {activeNav === 'Settings' && <SettingsScreen settings={settings} setSettings={setSettings} loadSampleData={loadSampleData} signOut={signOut} drive={drive} />}
+            {activeNav === 'Settings' && <SettingsScreen settings={settings} setSettings={setSettings} loadSampleData={loadSampleData} exportJson={exportJson} drive={drive} />}
           </div>
         </section>
       </div>
@@ -1136,7 +1136,7 @@ function Brand() {
   );
 }
 
-function TopBar({ settings, exportJson, drive }) {
+function TopBar({ settings, drive, signOut }) {
   const currentDate = toDate(todayIso).toLocaleDateString('en-IN', { weekday: 'long', month: 'long', day: 'numeric' });
   return (
     <header className="mb-5 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
@@ -1148,10 +1148,12 @@ function TopBar({ settings, exportJson, drive }) {
       <div className="flex flex-col items-stretch gap-2 md:items-end">
         <div className="flex flex-wrap gap-2">
           <DriveButton drive={drive} />
-          <button className="icon-button bg-[var(--primary)] text-white hover:bg-[var(--primary-dark)]" type="button" onClick={exportJson}>
-            <Archive size={17} />
-            Backup JSON
-          </button>
+          {drive.signedIn && (
+            <button className="icon-button" type="button" onClick={signOut}>
+              <LogOut size={17} />
+              Sign out
+            </button>
+          )}
         </div>
         {drive.error && <p className="max-w-xs text-right text-xs text-[var(--accent)]">{drive.error}</p>}
       </div>
@@ -1671,7 +1673,7 @@ function Reports({ stats, exportJson }) {
   );
 }
 
-function SettingsScreen({ settings, setSettings, loadSampleData, signOut, drive }) {
+function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, drive }) {
   return (
     <div className="grid gap-5 xl:grid-cols-2">
       <Panel>
@@ -1688,16 +1690,14 @@ function SettingsScreen({ settings, setSettings, loadSampleData, signOut, drive 
             {drive?.signedIn ? `Signed in as ${drive.email}. ` : ''}Data is stored in your own Google Drive and cached in this browser.
           </p>
           <div className="mt-3 flex flex-wrap gap-2">
+            <button className="icon-button" type="button" onClick={exportJson}>
+              <Archive size={17} />
+              Backup JSON
+            </button>
             <button className="icon-button" type="button" onClick={loadSampleData}>
               <RefreshCcw size={17} />
               Load sample data
             </button>
-            {drive?.signedIn && (
-              <button className="icon-button" type="button" onClick={signOut}>
-                <LogOut size={17} />
-                Sign out
-              </button>
-            )}
           </div>
         </div>
       </Panel>
