@@ -31,18 +31,48 @@ import { useGoogleDrive } from './googleDrive.js';
 
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || '';
 
-const currency = new Intl.NumberFormat('en-IN', {
-  style: 'currency',
-  currency: 'INR',
-  maximumFractionDigits: 0,
-});
+const CURRENCY_OPTIONS = ['INR', 'USD', 'EUR', 'GBP', 'AUD', 'CAD', 'SGD', 'AED'];
+const CURRENCY_LOCALES = { INR: 'en-IN' };
 
-const todayIso = '2026-06-10';
+function makeCurrencyFormatter(code) {
+  try {
+    return new Intl.NumberFormat(CURRENCY_LOCALES[code] || undefined, {
+      style: 'currency',
+      currency: code || 'INR',
+      currencyDisplay: 'narrowSymbol',
+      maximumFractionDigits: 0,
+    });
+  } catch {
+    return new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', currencyDisplay: 'narrowSymbol', maximumFractionDigits: 0 });
+  }
+}
+
+let currencyFormatter = makeCurrencyFormatter('INR');
+let activeCurrencyCode = 'INR';
+
+// Called during render from the settings currency so every formatMoney() below
+// reflects the therapist's chosen currency.
+function setActiveCurrency(code) {
+  if (code && code !== activeCurrencyCode) {
+    activeCurrencyCode = code;
+    currencyFormatter = makeCurrencyFormatter(code);
+  }
+}
+
+function formatMoney(amount) {
+  return currencyFormatter.format(amount || 0);
+}
+
+const todayIso = (() => {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+})();
 
 const initialSettings = {
   therapistName: '',
   practiceName: '',
   paymentDetails: '',
+  currency: 'INR',
   autoCreateCharges: true,
   lateCancellationHours: 24,
   lateCancellationCharge: 100,
@@ -334,7 +364,7 @@ function computeMonthlyStatement(client, period, sessions, charges, payments) {
 }
 
 function formatStatementText(statement, settings) {
-  const money = (n) => currency.format(n);
+  const money = (n) => formatMoney(n);
   const label = monthLabel(statement.period);
   const lines = [
     `${settings.practiceName} — Statement for ${label}`,
@@ -785,12 +815,13 @@ function App() {
     showNotice('Client added.');
   }
 
-  function completeSetup({ therapistName, practiceName, paymentDetails, loadSample }) {
+  function completeSetup({ therapistName, practiceName, paymentDetails, currency, loadSample }) {
     setSettings((prev) => ({
       ...prev,
       therapistName: therapistName.trim(),
       practiceName: practiceName.trim(),
       paymentDetails: paymentDetails.trim(),
+      currency: currency || 'INR',
       profileComplete: true,
     }));
     if (loadSample) {
@@ -847,6 +878,8 @@ function App() {
     }
     setImportResult({ imported: accepted.length, skipped, error });
   }
+
+  setActiveCurrency(settings.currency);
 
   const gate = settings.profileComplete ? 'app' : drive.signedIn ? 'setup' : 'signin';
 
@@ -1026,12 +1059,13 @@ function SetupScreen({ drive, onComplete }) {
   const [therapistName, setTherapistName] = useState(drive.name || '');
   const [practiceName, setPracticeName] = useState('');
   const [paymentDetails, setPaymentDetails] = useState('');
+  const [currency, setCurrency] = useState('INR');
   const [loadSample, setLoadSample] = useState(false);
 
   function submit(event) {
     event.preventDefault();
     if (!therapistName.trim()) return;
-    onComplete({ therapistName, practiceName, paymentDetails, loadSample });
+    onComplete({ therapistName, practiceName, paymentDetails, currency, loadSample });
   }
 
   return (
@@ -1053,6 +1087,7 @@ function SetupScreen({ drive, onComplete }) {
           <Input label="Your name" value={therapistName} onChange={setTherapistName} />
           <Input label="Practice name" value={practiceName} onChange={setPracticeName} />
           <Input label="Payment details (UPI / bank) — optional" value={paymentDetails} onChange={setPaymentDetails} />
+          <Select label="Currency" value={currency} options={CURRENCY_OPTIONS} onChange={setCurrency} />
           <label className="flex items-center gap-2 rounded-md border border-[var(--line)] bg-[var(--bg)] p-3 text-sm">
             <input type="checkbox" className="h-4 w-4 accent-[var(--primary)]" checked={loadSample} onChange={(event) => setLoadSample(event.target.checked)} />
             Load sample clients so I can explore first
@@ -1223,8 +1258,8 @@ function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient,
     <div className="space-y-5">
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard title="Today's Sessions" value={stats.today} icon={CalendarDays} />
-        <StatCard title="Outstanding Amount" value={currency.format(stats.outstanding)} icon={WalletCards} />
-        <StatCard title="Collected This Month" value={currency.format(stats.collected)} icon={CreditCard} />
+        <StatCard title="Outstanding Amount" value={formatMoney(stats.outstanding)} icon={WalletCards} />
+        <StatCard title="Collected This Month" value={formatMoney(stats.collected)} icon={CreditCard} />
         <StatCard title="Late Cancellations This Month" value={stats.lateCancels} icon={Clock3} />
       </div>
 
@@ -1251,7 +1286,7 @@ function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient,
                         <StatusBadge status={session.status} />
                       </div>
                       <h4 className="mt-1 text-lg font-semibold">{client.name}</h4>
-                      <p className="text-sm text-[var(--subtle)]">Outstanding {currency.format(ledger?.outstanding || 0)}</p>
+                      <p className="text-sm text-[var(--subtle)]">Outstanding {formatMoney(ledger?.outstanding || 0)}</p>
                     </div>
                     <div className="flex flex-wrap gap-2">
                       <SmallAction icon={Check} label="Present" onClick={() => statusSession(session.id, 'Present')} />
@@ -1283,8 +1318,8 @@ function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient,
                 {outstandingClients.map((client) => (
                   <tr key={client.id} className="bg-[var(--panel)]">
                     <td className="px-3 py-3 font-medium">{client.name}</td>
-                    <td className="px-3 py-3">{currency.format(ledgerByClient[client.id].outstanding)}</td>
-                    <td className="px-3 py-3">{currency.format(ledgerByClient[client.id].credit)}</td>
+                    <td className="px-3 py-3">{formatMoney(ledgerByClient[client.id].outstanding)}</td>
+                    <td className="px-3 py-3">{formatMoney(ledgerByClient[client.id].credit)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -1328,8 +1363,8 @@ function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessio
   const ledger = selectedClient ? ledgers[selectedClient.id] : null;
   const timeline = [
     ...selectedSessions.map((session) => ({ date: session.date, text: `Session ${session.status}` })),
-    ...selectedPayments.map((payment) => ({ date: payment.date, text: `Payment ${currency.format(payment.amount)}` })),
-    ...selectedCharges.map((charge) => ({ date: charge.date, text: `${charge.reason} ${currency.format(charge.amount)}` })),
+    ...selectedPayments.map((payment) => ({ date: payment.date, text: `Payment ${formatMoney(payment.amount)}` })),
+    ...selectedCharges.map((charge) => ({ date: charge.date, text: `${charge.reason} ${formatMoney(charge.amount)}` })),
   ].sort((a, b) => a.date.localeCompare(b.date));
 
   return (
@@ -1408,8 +1443,8 @@ function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessio
         <div className="mt-5">
           {clientTab === 'Overview' && selectedClient && ledger && (
             <div className="grid gap-3 sm:grid-cols-2">
-              <MiniMetric label="Outstanding Balance" value={currency.format(ledger.outstanding)} />
-              <MiniMetric label="Credit Balance" value={currency.format(ledger.credit)} />
+              <MiniMetric label="Outstanding Balance" value={formatMoney(ledger.outstanding)} />
+              <MiniMetric label="Credit Balance" value={formatMoney(ledger.credit)} />
               <MiniMetric label="Attendance Rate" value={`${attendanceFor(selectedSessions)}%`} />
               <MiniMetric label="Reminder Preference" value={selectedClient.reminder} />
               <MiniMetric label="Joining Date" value={selectedClient.joiningDate || '—'} />
@@ -1421,10 +1456,10 @@ function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessio
           {clientTab === 'Sessions' && <SimpleTable headers={['Date', 'Status', 'Charge']} rows={selectedSessions.map((session) => [formatDate(session.date), session.status, session.chargeId ? 'Generated' : '-'])} />}
           {clientTab === 'Financials' && selectedClient && ledger && (
             <div className="grid gap-3 sm:grid-cols-2">
-              <MiniMetric label="Total Charges" value={currency.format(ledger.totalCharges)} />
-              <MiniMetric label="Total Payments" value={currency.format(ledger.totalPayments)} />
-              <MiniMetric label="Outstanding" value={currency.format(ledger.outstanding)} />
-              <MiniMetric label="Credit Balance" value={currency.format(ledger.credit)} />
+              <MiniMetric label="Total Charges" value={formatMoney(ledger.totalCharges)} />
+              <MiniMetric label="Total Payments" value={formatMoney(ledger.totalPayments)} />
+              <MiniMetric label="Outstanding" value={formatMoney(ledger.outstanding)} />
+              <MiniMetric label="Credit Balance" value={formatMoney(ledger.credit)} />
             </div>
           )}
           {clientTab === 'Timeline' && (
@@ -1460,7 +1495,7 @@ function Groups({ groups, clients }) {
           </div>
           <div className="mt-4 grid gap-3 sm:grid-cols-2">
             <MiniMetric label="Billing Model" value={group.billingModel} />
-            <MiniMetric label="Session Fee" value={currency.format(group.sessionFee)} />
+            <MiniMetric label="Session Fee" value={formatMoney(group.sessionFee)} />
             <InfoBlock title="Schedule" text={group.schedule} wide />
             <InfoBlock title="Notes" text={group.notes} wide />
           </div>
@@ -1504,8 +1539,8 @@ function Payments({ clients, ledgers, payments, paymentDraft, setPaymentDraft, r
                   <p className="text-sm text-[var(--subtle)]">{formatDate(payment.date)} - {payment.method} - {payment.reference}</p>
                 </div>
                 <div className="text-left sm:text-right">
-                  <p className="font-semibold">{currency.format(payment.amount)}</p>
-                  <p className="text-sm text-[var(--subtle)]">Outstanding {currency.format(ledgers[payment.clientId]?.outstanding || 0)}</p>
+                  <p className="font-semibold">{formatMoney(payment.amount)}</p>
+                  <p className="text-sm text-[var(--subtle)]">Outstanding {formatMoney(ledgers[payment.clientId]?.outstanding || 0)}</p>
                 </div>
               </div>
             );
@@ -1572,9 +1607,9 @@ function Statements({ clients, sessions, charges, payments, settings, showNotice
         </div>
         <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <MiniMetric label="Clients with Activity" value={totals.active} />
-          <MiniMetric label="Revenue Billed" value={currency.format(totals.billed)} />
-          <MiniMetric label="Revenue Collected" value={currency.format(totals.collected)} />
-          <MiniMetric label="Outstanding" value={currency.format(totals.outstanding)} />
+          <MiniMetric label="Revenue Billed" value={formatMoney(totals.billed)} />
+          <MiniMetric label="Revenue Collected" value={formatMoney(totals.collected)} />
+          <MiniMetric label="Outstanding" value={formatMoney(totals.outstanding)} />
         </div>
         <label className="mt-4 flex w-fit items-center gap-2 text-sm text-[var(--subtle)]">
           <input type="checkbox" className="h-4 w-4 accent-[var(--primary)]" checked={showEmpty} onChange={(event) => setShowEmpty(event.target.checked)} />
@@ -1598,7 +1633,7 @@ function Statements({ clients, sessions, charges, payments, settings, showNotice
 }
 
 function StatementCard({ statement, onCopy }) {
-  const money = (n) => currency.format(n);
+  const money = (n) => formatMoney(n);
   const rows = [['Sessions attended', `${statement.attended} · ${money(statement.sessionFees)}`]];
   if (statement.lateCancels) rows.push(['Late cancellations', `${statement.lateCancels} · ${money(statement.lateFees)}`]);
   if (statement.cancellations) rows.push(['Cancellations', `${statement.cancellations}`]);
@@ -1647,10 +1682,10 @@ function Reports({ stats, exportJson }) {
     ['Sessions Scheduled', stats.sessionsScheduled],
     ['Sessions Attended', stats.sessionsAttended],
     ['Attendance %', `${stats.attendanceRate}%`],
-    ['Revenue Billed', currency.format(stats.revenueBilled)],
-    ['Revenue Collected', currency.format(stats.revenueCollected)],
-    ['Outstanding Amount', currency.format(stats.outstanding)],
-    ['Credit Balances', currency.format(stats.credit)],
+    ['Revenue Billed', formatMoney(stats.revenueBilled)],
+    ['Revenue Collected', formatMoney(stats.revenueCollected)],
+    ['Outstanding Amount', formatMoney(stats.outstanding)],
+    ['Credit Balances', formatMoney(stats.credit)],
     ['Collection Rate', `${stats.collectionRate}%`],
     ['Late Cancellations', stats.lateCancels],
   ];
@@ -1682,6 +1717,7 @@ function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, dri
           <Input label="Therapist Name" value={settings.therapistName} onChange={(value) => setSettings({ ...settings, therapistName: value })} />
           <Input label="Practice Name" value={settings.practiceName} onChange={(value) => setSettings({ ...settings, practiceName: value })} />
           <Input label="Payment Details (UPI / bank)" value={settings.paymentDetails || ''} onChange={(value) => setSettings({ ...settings, paymentDetails: value })} />
+          <Select label="Currency" value={settings.currency || 'INR'} options={CURRENCY_OPTIONS} onChange={(value) => setSettings({ ...settings, currency: value })} />
           <Select label="Theme" value={settings.theme} options={['Quiet Cream', 'Terracotta', 'Sage', 'Slate']} onChange={(value) => setSettings({ ...settings, theme: value })} />
         </div>
         <div className="mt-5 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
