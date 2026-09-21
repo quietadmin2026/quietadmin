@@ -919,9 +919,13 @@ function reconcileRecurringSessions(clients, sessions, today) {
 function reconcileGroupSessions(groups, groupSessions, today) {
   const horizonEnd = isoAddDays(today, RECURRING_HORIZON_DAYS);
   const groupById = Object.fromEntries(groups.map((group) => [group.id, group]));
+  // A group's optional run window: no auto meeting before startDate or after endDate.
+  const withinWindow = (group, iso) =>
+    (!group.startDate || iso >= group.startDate) && (!group.endDate || iso <= group.endDate);
   const matchesSlot = (group, session) =>
     group && group.status === 'Active' && group.recurring && group.day && group.time
-    && group.time === session.time && WEEKDAYS[toDate(session.date).getDay()] === group.day;
+    && group.time === session.time && WEEKDAYS[toDate(session.date).getDay()] === group.day
+    && withinWindow(group, session.date);
 
   const kept = groupSessions.filter((session) => {
     const unmarked = Object.keys(session.attendance || {}).length === 0;
@@ -936,11 +940,14 @@ function reconcileGroupSessions(groups, groupSessions, today) {
     if (group.status !== 'Active' || !group.recurring || !group.day || !group.time) continue;
     const targetDow = WEEKDAYS.indexOf(group.day);
     if (targetDow < 0) continue;
-    const cursor = toDate(today);
+    // Start no earlier than today or the group's start date, and stop at its end.
+    const startBound = group.startDate && group.startDate > today ? group.startDate : today;
+    const cursor = toDate(startBound);
     while (cursor.getDay() !== targetDow) cursor.setDate(cursor.getDate() + 1);
     for (; ; cursor.setDate(cursor.getDate() + 7)) {
       const iso = isoOf(cursor);
       if (iso > horizonEnd) break;
+      if (group.endDate && iso > group.endDate) break;
       const key = `${group.id}|${iso}|${group.time}`;
       if (existing.has(key)) continue;
       existing.add(key);
@@ -1519,6 +1526,21 @@ function App() {
     showNotice(`${next.name} updated.`);
   }
 
+  // Delete a group. Future/unmarked sessions go with it; any session that already
+  // has attendance marked — and the charges it created — is kept for the record.
+  function removeGroup(groupId) {
+    const group = groups.find((item) => item.id === groupId);
+    if (!group) return;
+    const marked = groupSessions.filter((s) => s.groupId === groupId && Object.keys(s.attendance || {}).length > 0);
+    const message = marked.length
+      ? `Delete ${group.name}? ${marked.length} past session${marked.length === 1 ? '' : 's'} with attendance — and their charges — stay on record. Upcoming, unmarked sessions are removed.`
+      : `Delete ${group.name}? This can't be undone.`;
+    if (!window.confirm(message)) return;
+    setGroups((current) => current.filter((item) => item.id !== groupId));
+    setGroupSessions((current) => current.filter((s) => s.groupId !== groupId || Object.keys(s.attendance || {}).length > 0));
+    showNotice(`${group.name} deleted.`);
+  }
+
   function addGroupSession(draft) {
     if (!draft.groupId || !draft.date || !draft.time) return false;
     const group = groupById[draft.groupId];
@@ -1786,6 +1808,7 @@ function App() {
                 today={today}
                 addGroup={addGroup}
                 updateGroup={updateGroup}
+                removeGroup={removeGroup}
                 addGroupSession={addGroupSession}
                 removeGroupSession={removeGroupSession}
                 markGroupAttendance={markGroupAttendance}
@@ -3203,7 +3226,7 @@ function ChargeEditModal({ charge, onSave, onClose }) {
 }
 
 function emptyGroup() {
-  return { name: '', type: 'Therapy', capacity: 8, billingModel: 'Per Session', sessionFee: 1200, schedule: '', status: 'Active', notes: '', members: [], recurring: false, day: '', time: '', duration: 90 };
+  return { name: '', type: 'Therapy', capacity: 8, billingModel: 'Per Session', sessionFee: 1200, schedule: '', status: 'Active', notes: '', members: [], recurring: false, day: '', time: '', duration: 90, startDate: '', endDate: '' };
 }
 
 function GroupSessionCard({ session, group, clients, onMark, onRemove }) {
@@ -3252,7 +3275,7 @@ function GroupSessionCard({ session, group, clients, onMark, onRemove }) {
   );
 }
 
-function Groups({ groups, clients, clientList, groupSessions, settings, today, addGroup, updateGroup, addGroupSession, removeGroupSession, markGroupAttendance }) {
+function Groups({ groups, clients, clientList, groupSessions, settings, today, addGroup, updateGroup, removeGroup, addGroupSession, removeGroupSession, markGroupAttendance }) {
   const [selectedId, setSelectedId] = useState(groups[0]?.id || null);
   const [editing, setEditing] = useState(null); // a group object, or 'new'
   const [draft, setDraft] = useState({ date: today, time: '18:00', duration: 90 });
@@ -3318,10 +3341,20 @@ function Groups({ groups, clients, clientList, groupSessions, settings, today, a
                   <h3 className="text-2xl font-semibold">{selected.name}</h3>
                   <p className="text-sm text-[var(--subtle)]">{selected.type} · {selected.status}</p>
                 </div>
-                <button type="button" className="icon-button px-3 py-2 text-xs" onClick={() => setEditing(selected)}>
-                  <Pencil size={14} />
-                  Edit
-                </button>
+                <div className="flex items-center gap-2">
+                  <button type="button" className="icon-button px-3 py-2 text-xs" onClick={() => setEditing(selected)}>
+                    <Pencil size={14} />
+                    Edit
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-button px-3 py-2 text-xs text-red-700 hover:bg-red-50"
+                    onClick={() => removeGroup(selected.id)}
+                  >
+                    <Trash2 size={14} />
+                    Delete
+                  </button>
+                </div>
               </div>
               <div className="mt-4 grid gap-3 sm:grid-cols-3">
                 <MiniMetric label="Billing" value={selected.billingModel} />
@@ -3332,10 +3365,15 @@ function Groups({ groups, clients, clientList, groupSessions, settings, today, a
                 const scheduleText = selected.recurring && selected.day && selected.time
                   ? `Weekly · ${selected.day} ${selected.time} · ${selected.duration || 90} min`
                   : selected.schedule;
-                if (!scheduleText && !selected.notes) return null;
+                const fmt = (iso) => formatDate(iso, { day: '2-digit', month: 'short', year: 'numeric' });
+                const windowText = selected.startDate || selected.endDate
+                  ? `${selected.startDate ? `From ${fmt(selected.startDate)}` : 'Open start'}${selected.endDate ? ` · Until ${fmt(selected.endDate)}` : ''}`
+                  : '';
+                if (!scheduleText && !windowText && !selected.notes) return null;
                 return (
                   <div className="mt-3 grid gap-3 sm:grid-cols-2">
                     {scheduleText && <InfoBlock title="Schedule" text={scheduleText} />}
+                    {windowText && <InfoBlock title="Runs" text={windowText} />}
                     {selected.notes && <InfoBlock title="Notes" text={selected.notes} />}
                   </div>
                 );
@@ -3412,6 +3450,10 @@ function GroupEditModal({ group, clientList, isNew, onSave, onClose }) {
   function submit(event) {
     event.preventDefault();
     if (!String(draft.name).trim()) return;
+    if (draft.startDate && draft.endDate && draft.endDate < draft.startDate) {
+      window.alert('End date is before the start date.');
+      return;
+    }
     onSave({
       ...draft,
       name: String(draft.name).trim(),
@@ -3445,6 +3487,11 @@ function GroupEditModal({ group, clientList, isNew, onSave, onClose }) {
           <Input label="Default Session Fee" type="number" value={draft.sessionFee} onChange={(value) => set({ sessionFee: value })} />
         </div>
         <p className="mt-1 text-xs text-[var(--subtle)]">Each member is billed their own session rate; this fee is used only for members with no rate set.</p>
+        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <Input label="Start date" type="date" value={draft.startDate || ''} onChange={(value) => set({ startDate: value })} />
+          <Input label="End date (optional)" type="date" value={draft.endDate || ''} onChange={(value) => set({ endDate: value })} />
+        </div>
+        <p className="mt-1 text-xs text-[var(--subtle)]">Weekly meetings and billing only begin on the start date. Leave the end date blank to keep the group running.</p>
         <div className="mt-3 rounded-md border border-[var(--line)] bg-[var(--bg)] p-3">
           <label className="flex items-center gap-2 text-sm font-medium">
             <input type="checkbox" className="h-4 w-4 accent-[var(--primary)]" checked={!!draft.recurring} onChange={(event) => set({ recurring: event.target.checked })} />
