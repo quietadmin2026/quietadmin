@@ -2675,6 +2675,8 @@ function Schedule({ sessions, clients, ledgerByClient, conflictIds, today, group
   const [weekStart, setWeekStart] = useState(() => startOfWeekIso(today));
   const [modalSession, setModalSession] = useState(null);
   const [groupModalId, setGroupModalId] = useState(null);
+  const [dragId, setDragId] = useState(null);
+  const [overDay, setOverDay] = useState(null);
 
   const days = Array.from({ length: 7 }, (_, i) => isoAddDays(weekStart, i));
   const weekEnd = days[6];
@@ -2691,13 +2693,28 @@ function Schedule({ sessions, clients, ledgerByClient, conflictIds, today, group
   const rangeLabel = `${formatDate(weekStart, { day: '2-digit', month: 'short' })} – ${formatDate(weekEnd, { day: '2-digit', month: 'short' })}`;
   const modalGroup = groupModalId ? (groupSessions || []).find((gs) => gs.id === groupModalId) : null;
 
+  // Drag a scheduled 1:1 session onto another day to move it there, keeping its
+  // time. Reuses reschedule (conflict check + audit trail); group blocks and
+  // already-marked sessions are not draggable, and dropping on the same day is a
+  // no-op. Desktop pointer drag only; tap still opens the modal for everything.
+  const dragged = dragId ? sessions.find((s) => s.id === dragId) : null;
+  function handleDropOnDay(iso) {
+    const id = dragId;
+    setOverDay(null);
+    setDragId(null);
+    if (!id) return;
+    const session = sessions.find((s) => s.id === id);
+    if (!session || session.date === iso) return;
+    reschedule(id, iso);
+  }
+
   return (
     <div className="space-y-5">
       <Panel>
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <h3 className="section-title">Schedule</h3>
-            <p className="section-subtitle">{rangeLabel} · tap a session or group to mark, reschedule or remove it.</p>
+            <p className="section-subtitle">{rangeLabel} · tap to mark or reschedule · drag a scheduled session to another day to move it.</p>
             {weekConflicts > 0 && (
               <p className="mt-1 inline-flex items-center gap-1 text-sm font-medium text-red-700">
                 <AlertTriangle size={14} />
@@ -2722,8 +2739,15 @@ function Schedule({ sessions, clients, ledgerByClient, conflictIds, today, group
           {days.map((iso) => {
             const isToday = iso === today;
             const dayed = byDay[iso];
+            const isDropTarget = !!dragged && overDay === iso && dragged.date !== iso;
             return (
-              <div key={iso} className={`rounded-md border p-2 ${isToday ? 'border-[var(--primary)] bg-[var(--bg)]' : 'border-[var(--line)] bg-[var(--panel)]'}`}>
+              <div
+                key={iso}
+                onDragOver={(event) => { if (dragged) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; if (overDay !== iso) setOverDay(iso); } }}
+                onDragLeave={(event) => { if (overDay === iso && !event.currentTarget.contains(event.relatedTarget)) setOverDay(null); }}
+                onDrop={(event) => { event.preventDefault(); handleDropOnDay(iso); }}
+                className={`rounded-md border p-2 transition ${isToday ? 'border-[var(--primary)] bg-[var(--bg)]' : 'border-[var(--line)] bg-[var(--panel)]'}${isDropTarget ? ' ring-2 ring-[var(--primary)] ring-offset-1' : ''}`}
+              >
                 <div className="mb-2 flex items-baseline justify-between px-1">
                   <span className={`text-xs font-semibold uppercase tracking-wide ${isToday ? 'text-[var(--primary)]' : 'text-[var(--subtle)]'}`}>
                     {formatDate(iso, { weekday: 'short' })}
@@ -2755,12 +2779,16 @@ function Schedule({ sessions, clients, ledgerByClient, conflictIds, today, group
                     const client = clients[item.clientId];
                     if (!client) return null;
                     const tone = STATUS_TONE[item.status] || STATUS_TONE.Scheduled;
+                    const canDrag = item.status === 'Scheduled';
                     return (
                       <button
                         key={item.id}
                         type="button"
+                        draggable={canDrag}
+                        onDragStart={canDrag ? (event) => { setDragId(item.id); event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', item.id); } : undefined}
+                        onDragEnd={() => { setDragId(null); setOverDay(null); }}
                         onClick={() => setModalSession(item)}
-                        className={`w-full rounded-md border px-2 py-1.5 text-left transition hover:brightness-95 ${tone.chip}${conflict ? ' ring-2 ring-red-400' : ''}`}
+                        className={`w-full rounded-md border px-2 py-1.5 text-left transition hover:brightness-95 ${tone.chip}${conflict ? ' ring-2 ring-red-400' : ''}${canDrag ? ' cursor-grab active:cursor-grabbing' : ''}${dragId === item.id ? ' opacity-40' : ''}`}
                       >
                         <span className="flex items-center gap-1.5">
                           <span className={`h-2 w-2 shrink-0 rounded-full ${tone.dot}`} />
