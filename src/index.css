@@ -2,13 +2,63 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Brand fonts — Inter (self-hosted, bundled with the brand kit) for product UI.
+   Plus Jakarta Sans (display headings) is loaded from Google Fonts in index.html. */
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/Inter-Regular.otf') format('opentype');
+}
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('/fonts/Inter-Medium.otf') format('opentype');
+}
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/fonts/Inter-SemiBold.otf') format('opentype');
+}
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/fonts/Inter-Bold.otf') format('opentype');
+}
+
+/* QuietAdmin brand palette — "The Quiet Q". One canonical identity.
+   Deep Teal primary · Sea Green positive · Terracotta accent · Warm Sand page. */
 :root {
-  color: #25312c;
-  background: #f7f4ee;
+  color: #282F33;
+  background: #F7EFE6;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+
+  --font-ui: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-display: 'Plus Jakarta Sans', var(--font-ui);
+
+  --bg: #F7EFE6;           /* Warm Sand — page background */
+  --panel: #FFFFFF;        /* White — cards / surfaces */
+  --panel-muted: #F1ECE2;  /* Warm soft neutral — insets, muted surfaces */
+  --text: #282F33;         /* Charcoal — primary text */
+  --subtle: #66706F;       /* Secondary text */
+  --line: #E3DED4;         /* Stone — borders / dividers */
+  --primary: #0F3D3A;      /* Deep Teal — primary actions, active nav, headings */
+  --primary-dark: #0A332F; /* Deep Teal — hover */
+  --accent: #D98A68;       /* Terracotta — restrained accent */
+  --accent-soft: #F5E6DC;  /* Soft terracotta wash */
+  --positive: #2E7D6B;     /* Sea Green — positive / present / paid */
+  --positive-soft: #E7F2ED;
+  --focus: rgba(46, 125, 107, 0.22);
 }
 
 * {
@@ -18,6 +68,13 @@
 body {
   margin: 0;
   min-width: 320px;
+  font-family: var(--font-ui);
+  line-height: 1.5;
+}
+
+h1, h2, h3, .section-title, .page-title {
+  font-family: var(--font-display);
+  letter-spacing: -0.015em;
 }
 
 button,
@@ -31,60 +88,8 @@ button:focus-visible,
 input:focus-visible,
 select:focus-visible,
 textarea:focus-visible {
-  outline: 3px solid rgba(76, 96, 83, 0.35);
+  outline: 3px solid var(--focus);
   outline-offset: 2px;
-}
-
-.theme-quiet-cream {
-  --bg: #f7f4ee;
-  --panel: #fffdfa;
-  --panel-muted: #eee8dc;
-  --text: #25312c;
-  --subtle: #69756c;
-  --line: #ded7c9;
-  --primary: #4c6053;
-  --primary-dark: #314039;
-  --accent: #b7794d;
-  --accent-soft: #f0ded0;
-}
-
-.theme-terracotta {
-  --bg: #f8f1ec;
-  --panel: #fffaf6;
-  --panel-muted: #f2dfd3;
-  --text: #352823;
-  --subtle: #7a665c;
-  --line: #e5cfc0;
-  --primary: #915b44;
-  --primary-dark: #5f3b2e;
-  --accent: #2f665d;
-  --accent-soft: #dcebe8;
-}
-
-.theme-sage {
-  --bg: #eff4ef;
-  --panel: #fbfffb;
-  --panel-muted: #dfe9df;
-  --text: #22312a;
-  --subtle: #66766c;
-  --line: #cfdccf;
-  --primary: #496953;
-  --primary-dark: #2f4637;
-  --accent: #a06d45;
-  --accent-soft: #f0e1d3;
-}
-
-.theme-slate {
-  --bg: #eef2f3;
-  --panel: #fcfefe;
-  --panel-muted: #dfe7e9;
-  --text: #1f2d33;
-  --subtle: #62747d;
-  --line: #cfdadd;
-  --primary: #435d68;
-  --primary-dark: #273a43;
-  --accent: #9b6a4b;
-  --accent-soft: #efded3;
 }
 
 .surface {

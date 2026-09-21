@@ -117,7 +117,6 @@ const initialSettings = {
   lateCancellationCharge: 100,
   monthlyStatements: true,
   outstandingReminders: true,
-  theme: 'Quiet Cream',
   profileComplete: false,
 };
 
@@ -267,13 +266,6 @@ const navItems = [
   ['Reports', BarChart3],
   ['Settings', Settings],
 ];
-
-const themeClass = {
-  'Quiet Cream': 'theme-quiet-cream',
-  Terracotta: 'theme-terracotta',
-  Sage: 'theme-sage',
-  Slate: 'theme-slate',
-};
 
 const STORAGE_PREFIX = 'quietadmin:';
 const STORAGE_KEYS = ['settings', 'clients', 'groups', 'sessions', 'groupSessions', 'charges', 'payments'];
@@ -1033,7 +1025,7 @@ function reconcileSubscriptionCharges(clients, charges, autoCreate, today) {
 }
 
 const CHARGE_STATUS_TONE = {
-  Paid: 'border-emerald-300 bg-emerald-50 text-emerald-700',
+  Paid: 'border-[#bcdcd0] bg-[var(--positive-soft)] text-[#246454]',
   'Partially Paid': 'border-amber-300 bg-amber-50 text-amber-700',
   Pending: 'border-[var(--line)] bg-[var(--panel-muted)] text-[var(--subtle)]',
 };
@@ -1680,7 +1672,7 @@ function App() {
 
   if (gate !== 'app') {
     return (
-      <main className={`${themeClass[settings.theme]} min-h-screen bg-[var(--bg)] text-[var(--text)]`}>
+      <main className="min-h-screen bg-[var(--bg)] text-[var(--text)]">
         {gate === 'signin' ? (
           <SignInScreen drive={drive} />
         ) : (
@@ -1691,7 +1683,7 @@ function App() {
   }
 
   return (
-    <main className={`${themeClass[settings.theme]} min-h-screen bg-[var(--bg)] text-[var(--text)]`}>
+    <main className="min-h-screen bg-[var(--bg)] text-[var(--text)]">
       <Toast toast={toast} onDismiss={dismissToast} />
       <div className="flex min-h-screen">
         <aside className="hidden w-72 shrink-0 border-r border-[var(--line)] bg-[var(--panel)] px-5 py-6 lg:block">
@@ -2163,9 +2155,7 @@ function Brand() {
   return (
     <div>
       <div className="flex items-center gap-3">
-        <div className="grid h-10 w-10 place-items-center rounded-md bg-[var(--primary)] text-white">
-          <ReceiptText size={21} />
-        </div>
+        <img src="/brand/QuietAdmin_Icon.svg" alt="QuietAdmin" className="h-10 w-10 rounded-[9px]" />
         <div>
           <h1 className="text-xl font-semibold tracking-normal">QuietAdmin</h1>
           <p className="text-sm text-[var(--subtle)]">The admin assistant for therapists.</p>
@@ -2317,7 +2307,7 @@ function Sparkline({ values }) {
 function TrendTile({ label, value, series, delta, tone, increased }) {
   const toneClass =
     tone === 'up'
-      ? 'text-emerald-700 bg-emerald-50 border-emerald-200'
+      ? 'text-[#246454] bg-[var(--positive-soft)] border-[#bcdcd0]'
       : tone === 'down'
         ? 'text-red-700 bg-red-50 border-red-200'
         : 'text-[var(--subtle)] bg-[var(--panel-muted)] border-[var(--line)]';
@@ -2675,7 +2665,7 @@ function Dashboard({ settings, view, setView, sessions, clients, clientList, led
 // Subtle, theme-friendly tint per status so the week reads at a glance.
 const STATUS_TONE = {
   Scheduled: { chip: 'border-[var(--line)] bg-[var(--panel)]', dot: 'bg-[var(--primary)]' },
-  Present: { chip: 'border-emerald-300 bg-emerald-50', dot: 'bg-emerald-500' },
+  Present: { chip: 'border-[#bcdcd0] bg-[var(--positive-soft)]', dot: 'bg-[var(--positive)]' },
   'Late Cancel': { chip: 'border-amber-300 bg-amber-50', dot: 'bg-amber-500' },
   Cancelled: { chip: 'border-[var(--line)] bg-[var(--panel-muted)] opacity-70', dot: 'bg-[var(--subtle)]' },
   Rescheduled: { chip: 'border-[var(--line)] bg-[var(--panel-muted)] opacity-70', dot: 'bg-[var(--subtle)]' },
@@ -3907,7 +3897,6 @@ function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, dri
           <Input label="Practice Name" value={settings.practiceName} onChange={(value) => setSettings({ ...settings, practiceName: value })} />
           <Input label="Payment Details (UPI / bank)" value={settings.paymentDetails || ''} onChange={(value) => setSettings({ ...settings, paymentDetails: value })} />
           <Select label="Currency" value={settings.currency || 'INR'} options={CURRENCY_OPTIONS} onChange={(value) => setSettings({ ...settings, currency: value })} />
-          <Select label="Theme" value={settings.theme} options={['Quiet Cream', 'Terracotta', 'Sage', 'Slate']} onChange={(value) => setSettings({ ...settings, theme: value })} />
         </div>
         <div className="mt-5 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
           <p className="text-sm font-semibold">Account &amp; data</p>

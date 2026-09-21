@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="360" viewBox="0 0 1400 360">
+  <rect width="1400" height="360" fill="#0F3D3A"/>
+  <g transform="translate(42 35)">
+    <circle cx="125" cy="125" r="92" fill="none" stroke="#FFFFFF" stroke-width="24"/>
+    <path d="M70 170 C105 145 140 145 174 170 C196 186 216 187 239 175" fill="none" stroke="#2E7D6B" stroke-width="18" stroke-linecap="round"/>
+    <path d="M69 193 C104 169 139 169 173 193 C195 208 215 209 239 198" fill="none" stroke="#A7C9B8" stroke-width="12" stroke-linecap="round"/>
+  </g>
+  <text x="270" y="145" font-family="Inter, Arial, sans-serif" font-size="92" font-weight="500" letter-spacing="-3" fill="#FFFFFF">quietadmin</text>
+</svg>
