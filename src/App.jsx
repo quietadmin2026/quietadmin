@@ -72,10 +72,40 @@ function formatMoney(amount) {
   return currencyFormatter.format(amount || 0);
 }
 
-const todayIso = (() => {
+// Today's local date, computed fresh each call. The app keeps this in state and
+// refreshes it at midnight / on refocus so a session left open past midnight
+// doesn't stay stuck on yesterday (see useToday).
+function computeToday() {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-})();
+}
+
+// A reactive "today" (YYYY-MM-DD) that updates when the local date rolls over:
+// a timer fires just after the next midnight, and refocus/visibility acts as a
+// backstop for a machine that was asleep. Updating state re-renders date-driven
+// views and re-runs the reconcile effects, so the new day fills in on its own.
+function useToday() {
+  const [today, setToday] = useState(computeToday);
+  useEffect(() => {
+    let timer;
+    const sync = () => setToday((prev) => { const now = computeToday(); return now === prev ? prev : now; });
+    const scheduleMidnight = () => {
+      const now = new Date();
+      const nextMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 5);
+      timer = window.setTimeout(() => { sync(); scheduleMidnight(); }, nextMidnight.getTime() - now.getTime());
+    };
+    scheduleMidnight();
+    const onVisible = () => { if (!document.hidden) sync(); };
+    window.addEventListener('focus', sync);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener('focus', sync);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, []);
+  return today;
+}
 
 const initialSettings = {
   therapistName: '',
@@ -779,10 +809,10 @@ function runClientImport({ rows, mapping, hasHeader, existingClients }) {
   return { accepted, skipped };
 }
 
-function isInPeriod(date, view) {
+function isInPeriod(date, view, today) {
   const target = toDate(date);
-  const start = toDate(todayIso);
-  if (view === 'Today') return date === todayIso;
+  const start = toDate(today);
+  if (view === 'Today') return date === today;
   if (view === 'Week') {
     const end = new Date(start);
     end.setDate(start.getDate() + 6);
@@ -831,12 +861,12 @@ function clientSlots(client) {
 // untouched. Returns the same array reference when nothing changes so callers
 // can skip a state update. Session ids are deterministic per (client, date,
 // time) so two devices generating the same slot never create a duplicate.
-function reconcileRecurringSessions(clients, sessions) {
-  const horizonEnd = isoAddDays(todayIso, RECURRING_HORIZON_DAYS);
+function reconcileRecurringSessions(clients, sessions, today) {
+  const horizonEnd = isoAddDays(today, RECURRING_HORIZON_DAYS);
   const clientById = Object.fromEntries(clients.map((client) => [client.id, client]));
 
   const kept = sessions.filter((session) => {
-    const stale = session.auto && session.status === 'Scheduled' && session.date >= todayIso;
+    const stale = session.auto && session.status === 'Scheduled' && session.date >= today;
     if (!stale) return true;
     const client = clientById[session.clientId];
     if (!client || client.status !== 'Active' || client.scheduleType !== 'Recurring') return false;
@@ -850,7 +880,7 @@ function reconcileRecurringSessions(clients, sessions) {
   for (const client of clients) {
     if (client.status !== 'Active' || client.scheduleType !== 'Recurring') continue;
     const startIso =
-      ISO_DATE.test(client.joiningDate || '') && client.joiningDate > todayIso ? client.joiningDate : todayIso;
+      ISO_DATE.test(client.joiningDate || '') && client.joiningDate > today ? client.joiningDate : today;
     for (const slot of clientSlots(client)) {
       const targetDow = WEEKDAYS.indexOf(slot.day);
       if (targetDow < 0) continue;
@@ -907,9 +937,9 @@ function monthsThrough(start, end) {
 // and, unlike the session engine, never removes anything — charges are money and
 // may already be paid, so a changed plan or fee just stops future generation and
 // leaves prior charges to be voided by hand. Same array reference when unchanged.
-function reconcileSubscriptionCharges(clients, charges, autoCreate) {
+function reconcileSubscriptionCharges(clients, charges, autoCreate, today) {
   if (!autoCreate) return charges;
-  const currentMonth = monthKey(todayIso);
+  const currentMonth = monthKey(today);
   const floorMonth = addMonths(currentMonth, -SUBSCRIPTION_BACKFILL_MONTHS);
 
   const billedMonths = {};
@@ -1059,6 +1089,7 @@ function App() {
   const [clientDraft, setClientDraft] = useState(emptyClient());
   const [toast, setToast] = useState(null); // { id, message, action }
   const toastTimer = useRef(null);
+  const today = useToday();
 
   const driveData = useMemo(
     () => ({ settings, clients, groups, sessions, groupSessions, charges, payments }),
@@ -1098,16 +1129,16 @@ function App() {
   // archive); reads the latest sessions via the functional update so it never
   // needs `sessions` in its deps and can't loop. reconcile is idempotent.
   useEffect(() => {
-    setSessions((current) => reconcileRecurringSessions(clients, current));
-  }, [clients, setSessions]);
+    setSessions((current) => reconcileRecurringSessions(clients, current, today));
+  }, [clients, today, setSessions]);
 
   // Auto-bill subscription clients a monthly fee (per-session clients are billed
   // on attendance instead). Reads the latest charges via the functional update
   // so it never needs `charges` in its deps and can't loop; reconcile is
   // idempotent and generation-only, so it never touches existing charges.
   useEffect(() => {
-    setCharges((current) => reconcileSubscriptionCharges(clients, current, settings.autoCreateCharges));
-  }, [clients, settings.autoCreateCharges, setCharges]);
+    setCharges((current) => reconcileSubscriptionCharges(clients, current, settings.autoCreateCharges, today));
+  }, [clients, settings.autoCreateCharges, today, setCharges]);
 
   const ledgers = useMemo(() => {
     return clients.map((client) => {
@@ -1154,7 +1185,7 @@ function App() {
   // Six-month practice trends for the dashboard: money (billed/collected) plus
   // activity (attendance, sessions, late cancels), oldest month first.
   const trends = useMemo(() => {
-    const periods = recentMonths(6, todayIso).slice().reverse();
+    const periods = recentMonths(6, today).slice().reverse();
     return periods.map((period) => {
       const eom = endOfMonthIso(period);
       const inMonth = (date) => monthKey(date) === period;
@@ -1174,7 +1205,7 @@ function App() {
         outstanding: Math.max(chargesToEom - paymentsToEom, 0),
       };
     });
-  }, [sessions, charges, payments]);
+  }, [sessions, charges, payments, today]);
 
   const goToClient = useCallback((id) => {
     setSelectedClientId(id);
@@ -1183,15 +1214,15 @@ function App() {
   }, []);
 
   const visibleSessions = useMemo(
-    () => sessions.filter((session) => isInPeriod(session.date, view)).sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`)),
-    [sessions, view],
+    () => sessions.filter((session) => isInPeriod(session.date, view, today)).sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`)),
+    [sessions, view, today],
   );
 
-  const monthSessions = sessions.filter((session) => isInPeriod(session.date, 'Month'));
+  const monthSessions = sessions.filter((session) => isInPeriod(session.date, 'Month', today));
   const totalOutstanding = ledgers.reduce((sum, ledger) => sum + ledger.outstanding, 0);
   const totalCredit = ledgers.reduce((sum, ledger) => sum + ledger.credit, 0);
-  const collectedThisMonth = payments.filter((payment) => isInPeriod(payment.date, 'Month')).reduce((sum, payment) => sum + payment.amount, 0);
-  const billedThisMonth = charges.filter((charge) => isInPeriod(charge.date, 'Month')).reduce((sum, charge) => sum + charge.amount, 0);
+  const collectedThisMonth = payments.filter((payment) => isInPeriod(payment.date, 'Month', today)).reduce((sum, payment) => sum + payment.amount, 0);
+  const billedThisMonth = charges.filter((charge) => isInPeriod(charge.date, 'Month', today)).reduce((sum, charge) => sum + charge.amount, 0);
   const attendedThisMonth = monthSessions.filter((session) => session.status === 'Present').length;
   const lateCancelsThisMonth = monthSessions.filter((session) => session.status === 'Late Cancel').length;
   const attendanceRate = monthSessions.length ? Math.round((attendedThisMonth / monthSessions.length) * 100) : 0;
@@ -1339,7 +1370,7 @@ function App() {
       {
         id: `p${Date.now()}`,
         clientId: paymentDraft.clientId,
-        date: todayIso,
+        date: today,
         amount,
         method: paymentDraft.method,
         reference: paymentDraft.reference || 'Manual',
@@ -1594,7 +1625,7 @@ function App() {
         <section className="min-w-0 flex-1">
           <MobileNav activeNav={activeNav} setActiveNav={setActiveNav} />
           <div className="mx-auto max-w-7xl px-4 py-5 sm:px-6 lg:px-8">
-            <TopBar settings={settings} drive={drive} signOut={signOut} />
+            <TopBar settings={settings} drive={drive} signOut={signOut} today={today} />
 
             {activeNav === 'Dashboard' && (
               <Dashboard
@@ -1608,8 +1639,9 @@ function App() {
                 conflictIds={conflictIds}
                 trends={trends}
                 goToClient={goToClient}
+                today={today}
                 stats={{
-                  today: sessions.filter((session) => session.date === todayIso).length,
+                  today: sessions.filter((session) => session.date === today).length,
                   outstanding: totalOutstanding,
                   collected: collectedThisMonth,
                   lateCancels: lateCancelsThisMonth,
@@ -1630,6 +1662,7 @@ function App() {
                 clients={clientById}
                 ledgerByClient={ledgerByClient}
                 conflictIds={conflictIds}
+                today={today}
                 statusSession={statusSession}
                 undoSession={undoSession}
                 reschedule={reschedule}
@@ -1668,6 +1701,7 @@ function App() {
                 clientList={clients}
                 groupSessions={groupSessions}
                 settings={settings}
+                today={today}
                 addGroup={addGroup}
                 updateGroup={updateGroup}
                 addGroupSession={addGroupSession}
@@ -1697,6 +1731,7 @@ function App() {
                 payments={payments}
                 settings={settings}
                 showNotice={showNotice}
+                today={today}
               />
             )}
 
@@ -2035,8 +2070,8 @@ function Brand() {
   );
 }
 
-function TopBar({ settings, drive, signOut }) {
-  const currentDate = toDate(todayIso).toLocaleDateString('en-IN', { weekday: 'long', month: 'long', day: 'numeric' });
+function TopBar({ settings, drive, signOut, today }) {
+  const currentDate = toDate(today).toLocaleDateString('en-IN', { weekday: 'long', month: 'long', day: 'numeric' });
   return (
     <header className="mb-5 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
       <div>
@@ -2352,11 +2387,11 @@ function ClientSearch({ clientList, ledgerByClient, goToClient }) {
   );
 }
 
-function Dashboard({ settings, view, setView, sessions, clients, clientList, ledgerByClient, conflictIds, trends, goToClient, stats, statusSession, undoSession, reschedule, removeSession, addSession, setPaymentDraft, setActiveNav }) {
+function Dashboard({ settings, view, setView, sessions, clients, clientList, ledgerByClient, conflictIds, trends, goToClient, today, stats, statusSession, undoSession, reschedule, removeSession, addSession, setPaymentDraft, setActiveNav }) {
   const outstandingClients = Object.values(clients).filter((client) => ledgerByClient[client.id]?.outstanding > 0);
   const activeClients = Object.values(clients).filter((client) => client.status === 'Active');
   const [adding, setAdding] = useState(false);
-  const [draft, setDraft] = useState({ clientId: '', date: todayIso, time: '10:00', duration: 60 });
+  const [draft, setDraft] = useState({ clientId: '', date: today, time: '10:00', duration: 60 });
   const [modalSession, setModalSession] = useState(null);
 
   function submitSession(event) {
@@ -2364,7 +2399,7 @@ function Dashboard({ settings, view, setView, sessions, clients, clientList, led
     const clientId = draft.clientId || activeClients[0]?.id || '';
     if (addSession({ ...draft, clientId })) {
       setAdding(false);
-      setDraft({ clientId: '', date: todayIso, time: '10:00', duration: 60 });
+      setDraft({ clientId: '', date: today, time: '10:00', duration: 60 });
     }
   }
 
@@ -2541,8 +2576,8 @@ const STATUS_TONE = {
   Rescheduled: { chip: 'border-[var(--line)] bg-[var(--panel-muted)] opacity-70', dot: 'bg-[var(--subtle)]' },
 };
 
-function Schedule({ sessions, clients, ledgerByClient, conflictIds, statusSession, undoSession, reschedule, removeSession }) {
-  const [weekStart, setWeekStart] = useState(() => startOfWeekIso(todayIso));
+function Schedule({ sessions, clients, ledgerByClient, conflictIds, today, statusSession, undoSession, reschedule, removeSession }) {
+  const [weekStart, setWeekStart] = useState(() => startOfWeekIso(today));
   const [modalSession, setModalSession] = useState(null);
 
   const days = Array.from({ length: 7 }, (_, i) => isoAddDays(weekStart, i));
@@ -2578,7 +2613,7 @@ function Schedule({ sessions, clients, ledgerByClient, conflictIds, statusSessio
             <button type="button" className="icon-button px-3 py-2 text-xs" onClick={() => setWeekStart(isoAddDays(weekStart, -7))} aria-label="Previous week">
               <ChevronLeft size={16} />
             </button>
-            <button type="button" className="icon-button px-3 py-2 text-xs" onClick={() => setWeekStart(startOfWeekIso(todayIso))}>
+            <button type="button" className="icon-button px-3 py-2 text-xs" onClick={() => setWeekStart(startOfWeekIso(today))}>
               This week
             </button>
             <button type="button" className="icon-button px-3 py-2 text-xs" onClick={() => setWeekStart(isoAddDays(weekStart, 7))} aria-label="Next week">
@@ -2589,7 +2624,7 @@ function Schedule({ sessions, clients, ledgerByClient, conflictIds, statusSessio
 
         <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-7">
           {days.map((iso) => {
-            const isToday = iso === todayIso;
+            const isToday = iso === today;
             const dayed = byDay[iso];
             return (
               <div key={iso} className={`rounded-md border p-2 ${isToday ? 'border-[var(--primary)] bg-[var(--bg)]' : 'border-[var(--line)] bg-[var(--panel)]'}`}>
@@ -3098,10 +3133,10 @@ function GroupSessionCard({ session, group, clients, onMark, onRemove }) {
   );
 }
 
-function Groups({ groups, clients, clientList, groupSessions, settings, addGroup, updateGroup, addGroupSession, removeGroupSession, markGroupAttendance }) {
+function Groups({ groups, clients, clientList, groupSessions, settings, today, addGroup, updateGroup, addGroupSession, removeGroupSession, markGroupAttendance }) {
   const [selectedId, setSelectedId] = useState(groups[0]?.id || null);
   const [editing, setEditing] = useState(null); // a group object, or 'new'
-  const [draft, setDraft] = useState({ date: todayIso, time: '18:00', duration: 90 });
+  const [draft, setDraft] = useState({ date: today, time: '18:00', duration: 90 });
 
   const selected = groups.find((group) => group.id === selectedId) || groups[0] || null;
   const sessions = useMemo(
@@ -3114,7 +3149,7 @@ function Groups({ groups, clients, clientList, groupSessions, settings, addGroup
   function submitSession(event) {
     event.preventDefault();
     if (!selected) return;
-    if (addGroupSession({ ...draft, groupId: selected.id })) setDraft({ date: todayIso, time: '18:00', duration: 90 });
+    if (addGroupSession({ ...draft, groupId: selected.id })) setDraft({ date: today, time: '18:00', duration: 90 });
   }
 
   return (
@@ -3401,8 +3436,8 @@ function Payments({ clients, ledgers, payments, charges, allocation, paymentDraf
   );
 }
 
-function Statements({ clients, sessions, charges, payments, settings, showNotice }) {
-  const months = useMemo(() => recentMonths(6, todayIso), []);
+function Statements({ clients, sessions, charges, payments, settings, showNotice, today }) {
+  const months = useMemo(() => recentMonths(6, today), [today]);
   const [period, setPeriod] = useState(months[0]);
   const [showEmpty, setShowEmpty] = useState(false);
 
