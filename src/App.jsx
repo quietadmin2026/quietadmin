@@ -462,14 +462,6 @@ const CLIENT_CSV_ENUMS = {
   day: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'],
 };
 
-const CSV_HEADER_TO_FIELD = {
-  name: 'name', email: 'email', phone: 'phone', type: 'type', 'billing model': 'billingModel',
-  'session rate': 'sessionRate', 'monthly fee': 'monthlyFee', 'collection method': 'collectionMethod',
-  'schedule type': 'scheduleType', 'session day': 'day', 'session time': 'time',
-  'session day 2': 'day2', 'session time 2': 'time2', duration: 'duration',
-  'reminder preference': 'reminder', tags: 'tags', 'joining date': 'joiningDate',
-  status: 'status', notes: 'notes',
-};
 
 function csvEscape(value) {
   const text = value == null ? '' : String(value);
@@ -480,9 +472,10 @@ function toCsv(rows) {
   return rows.map((row) => row.map(csvEscape).join(',')).join('\n');
 }
 
-// RFC-4180-style parser: handles quoted fields, embedded commas/quotes/newlines.
-function parseCsv(text) {
-  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+// RFC-4180-style parser for a chosen delimiter: handles quoted fields with
+// embedded delimiters/quotes/newlines. Strips a leading BOM from Excel exports.
+function parseDelimited(text, delimiter) {
+  const normalized = text.replace(/^﻿/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   const rows = [];
   let row = [];
   let field = '';
@@ -497,7 +490,7 @@ function parseCsv(text) {
       }
     } else if (ch === '"') {
       inQuotes = true;
-    } else if (ch === ',') {
+    } else if (ch === delimiter) {
       row.push(field);
       field = '';
     } else if (ch === '\n') {
@@ -516,9 +509,13 @@ function parseCsv(text) {
   return rows;
 }
 
-function matchEnum(value, options) {
-  const target = (value || '').trim().toLowerCase();
-  return options.find((option) => option.toLowerCase() === target) || null;
+// Detect comma vs tab from the first line so a spreadsheet paste (tab-separated)
+// works as well as a downloaded CSV.
+function parseTable(text) {
+  const firstLine = text.replace(/^﻿/, '').split(/\r?\n/, 1)[0] || '';
+  const tabs = (firstLine.match(/\t/g) || []).length;
+  const commas = (firstLine.match(/,/g) || []).length;
+  return parseDelimited(text, tabs > commas ? '\t' : ',');
 }
 
 function clientToCsvRow(client) {
@@ -538,137 +535,248 @@ function scheduleSummary(client) {
   return slots.length ? `${base} - ${slots.join(', ')}` : base;
 }
 
-// Parse + validate a client CSV into { imported, skipped, error }.
-function importClientsCsv(text, existingClients) {
-  const rows = parseCsv(text).filter((row) => row.some((cell) => (cell || '').trim() !== ''));
-  if (rows.length === 0) return { accepted: [], skipped: [], error: 'The file is empty.' };
+// The importable client fields, each with the header names we recognise for it.
+// Only Name is required; everything else defaults when blank or unreadable.
+const IMPORT_FIELDS = [
+  { key: 'name', label: 'Name', kind: 'text', aliases: ['name', 'full name', 'client', 'client name', 'patient'] },
+  { key: 'email', label: 'Email', kind: 'text', aliases: ['email', 'email address', 'e mail'] },
+  { key: 'phone', label: 'Phone', kind: 'text', aliases: ['phone', 'mobile', 'contact', 'phone number', 'cell', 'mobile number', 'contact number'] },
+  { key: 'type', label: 'Type', kind: 'enum', options: CLIENT_CSV_ENUMS.type, def: 'Individual', aliases: ['type', 'client type'] },
+  { key: 'billingModel', label: 'Billing Model', kind: 'enum', options: CLIENT_CSV_ENUMS.billingModel, def: 'Per Session', aliases: ['billing model', 'billing', 'plan'] },
+  { key: 'sessionRate', label: 'Session Rate', kind: 'number', def: 0, aliases: ['session rate', 'rate', 'fee', 'session fee', 'price', 'amount'] },
+  { key: 'monthlyFee', label: 'Monthly Fee', kind: 'number', def: 0, aliases: ['monthly fee', 'subscription fee', 'monthly', 'retainer'] },
+  { key: 'collectionMethod', label: 'Collection Method', kind: 'enum', options: CLIENT_CSV_ENUMS.collectionMethod, def: 'Pay After Session', aliases: ['collection method', 'payment timing', 'collection'] },
+  { key: 'scheduleType', label: 'Schedule Type', kind: 'enum', options: CLIENT_CSV_ENUMS.scheduleType, def: 'Manual', aliases: ['schedule type', 'schedule'] },
+  { key: 'day', label: 'Session Day', kind: 'day', aliases: ['session day', 'day', 'weekday'] },
+  { key: 'time', label: 'Session Time', kind: 'time', aliases: ['session time', 'time'] },
+  { key: 'day2', label: 'Session Day 2', kind: 'day', aliases: ['session day 2', 'day 2', 'second day'] },
+  { key: 'time2', label: 'Session Time 2', kind: 'time', aliases: ['session time 2', 'time 2', 'second time'] },
+  { key: 'duration', label: 'Duration', kind: 'number', def: 60, aliases: ['duration', 'length', 'minutes', 'mins'] },
+  { key: 'reminder', label: 'Reminder Preference', kind: 'enum', options: CLIENT_CSV_ENUMS.reminder, def: 'None', aliases: ['reminder preference', 'reminder', 'reminders'] },
+  { key: 'tags', label: 'Tags', kind: 'tags', aliases: ['tags', 'labels', 'groups'] },
+  { key: 'joiningDate', label: 'Joining Date', kind: 'date', aliases: ['joining date', 'start date', 'since', 'joined', 'date joined'] },
+  { key: 'status', label: 'Status', kind: 'enum', options: CLIENT_CSV_ENUMS.status, def: 'Active', aliases: ['status', 'active'] },
+  { key: 'notes', label: 'Notes', kind: 'text', aliases: ['notes', 'note', 'comments', 'remarks'] },
+];
 
-  const header = rows[0].map((h) => h.trim().toLowerCase());
-  const fieldByCol = header.map((h) => CSV_HEADER_TO_FIELD[h] || null);
-  const presentFields = new Set(fieldByCol.filter(Boolean));
-  const requiredColumns = [['name', 'Name'], ['phone', 'Phone'], ['type', 'Type'], ['billingModel', 'Billing Model']];
-  const missing = requiredColumns.filter(([field]) => !presentFields.has(field)).map(([, label]) => label);
-  if (missing.length) return { accepted: [], skipped: [], error: `Missing required column(s): ${missing.join(', ')}.` };
+const IMPORT_FIELD_BY_KEY = Object.fromEntries(IMPORT_FIELDS.map((field) => [field.key, field]));
 
-  const dateRe = /^\d{4}-\d{2}-\d{2}$/;
-  const timeRe = /^\d{1,2}:\d{2}$/;
+// Header text (any casing/spacing/underscores) → field key.
+const IMPORT_ALIAS_TO_KEY = (() => {
+  const map = {};
+  for (const field of IMPORT_FIELDS) {
+    map[field.key] = field.key;
+    for (const alias of field.aliases) map[alias] = field.key;
+  }
+  return map;
+})();
+
+// Common human spellings for each enum value, so "1:1", "sub", "weekly" resolve.
+const ENUM_SYNONYMS = {
+  Individual: ['individual', '1:1', '1-1', 'solo', 'one on one', 'personal', 'indiv'],
+  Group: ['group', 'grp'],
+  Supervision: ['supervision', 'supervisee', 'supervisor', 'superv'],
+  'Per Session': ['per session', 'session', 'pay per session', 'per-session', 'sessional', 'hourly'],
+  Subscription: ['subscription', 'monthly', 'retainer', 'package', 'sub'],
+  Custom: ['custom', 'other', 'mixed'],
+  'Pay Before Session': ['pay before session', 'before', 'advance', 'prepay', 'upfront'],
+  'Pay After Session': ['pay after session', 'after', 'postpay', 'on the day'],
+  'Monthly Invoice': ['monthly invoice', 'invoice', 'billed monthly'],
+  'Advance Deposit': ['advance deposit', 'deposit', 'prepaid'],
+  Recurring: ['recurring', 'weekly', 'repeat', 'fixed', 'standing'],
+  Manual: ['manual', 'adhoc', 'ad hoc', 'one off', 'one-off', 'as needed'],
+  Email: ['email', 'e mail', 'mail'],
+  WhatsApp: ['whatsapp', 'wa', 'whats app', 'whatapp'],
+  Both: ['both', 'all', 'email and whatsapp'],
+  None: ['none', 'no', 'off', 'nil'],
+  Active: ['active', 'current', 'yes', 'on', 'ongoing'],
+  Archived: ['archived', 'inactive', 'former', 'closed', 'ended', 'past', 'discharged'],
+};
+
+const IMPORT_DAYS = CLIENT_CSV_ENUMS.day;
+
+function normalizeHeader(text) {
+  return String(text || '').trim().toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ');
+}
+
+// Auto-map each column of a header row to a field key ('' = unmapped).
+function autoMapColumns(headerCells) {
+  return headerCells.map((cell) => IMPORT_ALIAS_TO_KEY[normalizeHeader(cell)] || '');
+}
+
+function cleanNumber(raw) {
+  const stripped = String(raw || '').replace(/[^0-9.\-]/g, '');
+  if (stripped === '' || stripped === '-' || stripped === '.') return null;
+  const n = Number(stripped);
+  return Number.isNaN(n) ? null : n;
+}
+
+function matchEnumLoose(raw, options) {
+  const target = String(raw || '').trim().toLowerCase();
+  if (!target) return null;
+  for (const option of options) if (option.toLowerCase() === target) return option;
+  for (const option of options) {
+    const syns = ENUM_SYNONYMS[option] || [];
+    if (syns.includes(target)) return option;
+    if (target.length >= 2 && (syns.some((s) => s.includes(target) || target.includes(s)) || option.toLowerCase().includes(target))) return option;
+  }
+  return null;
+}
+
+function matchDay(raw) {
+  const target = String(raw || '').trim().toLowerCase();
+  if (!target) return '';
+  return IMPORT_DAYS.find((day) => day.toLowerCase() === target || day.toLowerCase().startsWith(target.slice(0, 3))) || null;
+}
+
+function normalizeTime(raw) {
+  const target = String(raw || '').trim();
+  if (!target) return '';
+  let m = target.match(/^(\d{1,2}):(\d{2})\s*([ap]\.?m\.?)?$/i);
+  if (m) {
+    let h = Number(m[1]);
+    const ap = (m[3] || '').toLowerCase();
+    if (ap.startsWith('p') && h < 12) h += 12;
+    if (ap.startsWith('a') && h === 12) h = 0;
+    if (h > 23 || Number(m[2]) > 59) return null;
+    return `${String(h).padStart(2, '0')}:${m[2]}`;
+  }
+  m = target.match(/^(\d{1,2})\s*([ap]\.?m\.?)$/i);
+  if (m) {
+    let h = Number(m[1]);
+    const ap = m[2].toLowerCase();
+    if (ap.startsWith('p') && h < 12) h += 12;
+    if (ap.startsWith('a') && h === 12) h = 0;
+    if (h > 23) return null;
+    return `${String(h).padStart(2, '0')}:00`;
+  }
+  m = target.match(/^(\d{1,2})$/);
+  if (m && Number(m[1]) <= 23) return `${String(Number(m[1])).padStart(2, '0')}:00`;
+  return null;
+}
+
+function normalizeDate(raw) {
+  const target = String(raw || '').trim();
+  if (!target) return '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(target)) return target;
+  const m = target.match(/^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})$/);
+  if (m) {
+    const y = m[3].length === 2 ? `20${m[3]}` : m[3];
+    const a = Number(m[1]);
+    const b = Number(m[2]);
+    // Ambiguous d/m vs m/d: use whichever is unambiguous, else assume day-first.
+    const day = a > 12 ? a : b > 12 ? b : a;
+    const mon = a > 12 ? b : b > 12 ? a : b;
+    if (mon < 1 || mon > 12 || day < 1 || day > 31) return null;
+    return `${y}-${String(mon).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  }
+  const parsed = new Date(target);
+  return Number.isNaN(parsed.getTime()) ? null : isoOf(parsed);
+}
+
+// Build one client from its mapped values. Never fails on a bad cell — it
+// defaults and records a warning — so only a missing Name stops a row.
+function buildClient(getValue) {
+  const warnings = [];
+  const enumField = (key, def) => {
+    const raw = getValue(key);
+    if (!raw) return def;
+    const match = matchEnumLoose(raw, IMPORT_FIELD_BY_KEY[key].options);
+    if (match) return match;
+    warnings.push(`${IMPORT_FIELD_BY_KEY[key].label} “${raw}” not recognised — used ${def}`);
+    return def;
+  };
+  const numField = (key, def) => {
+    const raw = getValue(key);
+    if (!raw) return def;
+    const n = cleanNumber(raw);
+    if (n !== null) return n;
+    warnings.push(`${IMPORT_FIELD_BY_KEY[key].label} “${raw}” isn’t a number — used ${def}`);
+    return def;
+  };
+  const dayField = (key) => {
+    const raw = getValue(key);
+    if (!raw) return '';
+    const match = matchDay(raw);
+    if (match) return match;
+    warnings.push(`${IMPORT_FIELD_BY_KEY[key].label} “${raw}” isn’t a weekday — left blank`);
+    return '';
+  };
+  const timeField = (key) => {
+    const raw = getValue(key);
+    if (!raw) return '';
+    const match = normalizeTime(raw);
+    if (match !== null) return match;
+    warnings.push(`${IMPORT_FIELD_BY_KEY[key].label} “${raw}” isn’t a time — left blank`);
+    return '';
+  };
+
+  let joiningDate = '';
+  const dateRaw = getValue('joiningDate');
+  if (dateRaw) {
+    const parsed = normalizeDate(dateRaw);
+    if (parsed) joiningDate = parsed;
+    else warnings.push(`Joining Date “${dateRaw}” isn’t a date — left blank`);
+  }
+  const rawDuration = numField('duration', 60);
+
+  const client = {
+    name: getValue('name').trim(),
+    email: getValue('email'),
+    phone: getValue('phone'),
+    type: enumField('type', 'Individual'),
+    billingModel: enumField('billingModel', 'Per Session'),
+    sessionRate: numField('sessionRate', 0),
+    monthlyFee: numField('monthlyFee', 0),
+    collectionMethod: enumField('collectionMethod', 'Pay After Session'),
+    scheduleType: enumField('scheduleType', 'Manual'),
+    day: dayField('day'),
+    time: timeField('time'),
+    day2: dayField('day2'),
+    time2: timeField('time2'),
+    duration: rawDuration > 0 ? rawDuration : 60,
+    reminder: enumField('reminder', 'None'),
+    tags: getValue('tags') ? getValue('tags').split(/[;,]/).map((t) => t.trim()).filter(Boolean) : [],
+    joiningDate,
+    notes: getValue('notes'),
+    status: enumField('status', 'Active'),
+    cancellationRule: 'Use Practice Default',
+  };
+  return { client, warnings };
+}
+
+// Turn parsed rows + a column→field mapping into importable clients. Blank rows
+// and the template's EXAMPLE row are ignored; a row with no Name is skipped; a
+// name+phone already present (existing or earlier in the file) is a duplicate.
+function runClientImport({ rows, mapping, hasHeader, existingClients }) {
+  const dataRows = hasHeader ? rows.slice(1) : rows;
   const normName = (s) => (s || '').trim().toLowerCase();
   const normPhone = (s) => (s || '').replace(/\D/g, '');
-  const seen = new Set(existingClients.map((c) => `${normName(c.name)}|${normPhone(c.phone)}`));
-
+  const seen = new Set((existingClients || []).map((c) => `${normName(c.name)}|${normPhone(c.phone)}`));
   const accepted = [];
   const skipped = [];
+  const stamp = Date.now();
 
-  for (let r = 1; r < rows.length; r += 1) {
-    const raw = rows[r];
-    const get = (field) => {
-      const idx = fieldByCol.indexOf(field);
-      return idx >= 0 ? (raw[idx] ?? '').trim() : '';
+  dataRows.forEach((raw, i) => {
+    if (raw.every((cell) => String(cell ?? '').trim() === '')) return;
+    const rowNum = i + (hasHeader ? 2 : 1);
+    const getValue = (key) => {
+      const idx = mapping.indexOf(key);
+      return idx >= 0 ? String(raw[idx] ?? '').trim() : '';
     };
-    const name = get('name');
-    if (name.toLowerCase().startsWith('example')) continue; // skip the template row
+    const name = getValue('name').trim();
+    if (name.toLowerCase().startsWith('example')) return;
+    if (!name) { skipped.push({ row: rowNum, name: '(blank)', reason: 'no Name' }); return; }
 
-    const rowNum = r + 1;
-    const reject = (reason) => skipped.push({ row: rowNum, name: name || '(blank)', reason });
-
-    if (!name) { reject('missing Name'); continue; }
-    const phone = get('phone');
-    if (!phone) { reject('missing Phone'); continue; }
-    const type = matchEnum(get('type'), CLIENT_CSV_ENUMS.type);
-    if (!type) { reject(`invalid Type "${get('type')}"`); continue; }
-    const billingModel = matchEnum(get('billingModel'), CLIENT_CSV_ENUMS.billingModel);
-    if (!billingModel) { reject(`invalid Billing Model "${get('billingModel')}"`); continue; }
-
-    const rateStr = get('sessionRate');
-    const feeStr = get('monthlyFee');
-    const rate = rateStr === '' ? null : Number(rateStr);
-    const fee = feeStr === '' ? null : Number(feeStr);
-    if (rate !== null && Number.isNaN(rate)) { reject(`Session Rate "${rateStr}" is not a number`); continue; }
-    if (fee !== null && Number.isNaN(fee)) { reject(`Monthly Fee "${feeStr}" is not a number`); continue; }
-    if (billingModel === 'Per Session' && rate === null) { reject('Session Rate is required for Per Session'); continue; }
-    if (billingModel === 'Subscription' && fee === null) { reject('Monthly Fee is required for Subscription'); continue; }
-    if (billingModel === 'Custom' && rate === null && fee === null) { reject('Custom needs a Session Rate or Monthly Fee'); continue; }
-
-    let collectionMethod = 'Pay After Session';
-    if (get('collectionMethod')) {
-      const m = matchEnum(get('collectionMethod'), CLIENT_CSV_ENUMS.collectionMethod);
-      if (!m) { reject(`invalid Collection Method "${get('collectionMethod')}"`); continue; }
-      collectionMethod = m;
-    }
-    let scheduleType = 'Manual';
-    if (get('scheduleType')) {
-      const m = matchEnum(get('scheduleType'), CLIENT_CSV_ENUMS.scheduleType);
-      if (!m) { reject(`invalid Schedule Type "${get('scheduleType')}"`); continue; }
-      scheduleType = m;
-    }
-    let day = '';
-    if (get('day')) {
-      const m = matchEnum(get('day'), CLIENT_CSV_ENUMS.day);
-      if (!m) { reject(`invalid Session Day "${get('day')}"`); continue; }
-      day = m;
-    }
-    let day2 = '';
-    if (get('day2')) {
-      const m = matchEnum(get('day2'), CLIENT_CSV_ENUMS.day);
-      if (!m) { reject(`invalid Session Day 2 "${get('day2')}"`); continue; }
-      day2 = m;
-    }
-    const time = get('time');
-    if (time && !timeRe.test(time)) { reject(`invalid Session Time "${time}" (use HH:MM)`); continue; }
-    const time2 = get('time2');
-    if (time2 && !timeRe.test(time2)) { reject(`invalid Session Time 2 "${time2}" (use HH:MM)`); continue; }
-
-    let duration = 60;
-    if (get('duration')) {
-      const d = Number(get('duration'));
-      if (Number.isNaN(d) || d <= 0) { reject(`invalid Duration "${get('duration')}"`); continue; }
-      duration = d;
-    }
-    let reminder = 'None';
-    if (get('reminder')) {
-      const m = matchEnum(get('reminder'), CLIENT_CSV_ENUMS.reminder);
-      if (!m) { reject(`invalid Reminder Preference "${get('reminder')}"`); continue; }
-      reminder = m;
-    }
-    let status = 'Active';
-    if (get('status')) {
-      const m = matchEnum(get('status'), CLIENT_CSV_ENUMS.status);
-      if (!m) { reject(`invalid Status "${get('status')}"`); continue; }
-      status = m;
-    }
-    const joiningDate = get('joiningDate');
-    if (joiningDate && !dateRe.test(joiningDate)) { reject(`invalid Joining Date "${joiningDate}" (use YYYY-MM-DD)`); continue; }
-
-    const key = `${normName(name)}|${normPhone(phone)}`;
-    if (seen.has(key)) { skipped.push({ row: rowNum, name, reason: 'duplicate (Name + Phone)' }); continue; }
+    const { client, warnings } = buildClient(getValue);
+    const key = `${normName(name)}|${normPhone(client.phone)}`;
+    if (seen.has(key)) { skipped.push({ row: rowNum, name, reason: 'duplicate (Name + Phone)' }); return; }
     seen.add(key);
+    client.id = `c${stamp}${accepted.length}`;
+    accepted.push({ client, warnings });
+  });
 
-    accepted.push({
-      id: `c${Date.now()}${accepted.length}`,
-      name,
-      email: get('email'),
-      phone,
-      type,
-      billingModel,
-      sessionRate: rate ?? 0,
-      monthlyFee: fee ?? 0,
-      collectionMethod,
-      scheduleType,
-      day,
-      time,
-      day2,
-      time2,
-      duration,
-      reminder,
-      tags: get('tags') ? get('tags').split(';').map((t) => t.trim()).filter(Boolean) : [],
-      joiningDate,
-      notes: get('notes'),
-      status,
-      cancellationRule: 'Use Practice Default',
-    });
-  }
-
-  return { accepted, skipped, error: null };
+  return { accepted, skipped };
 }
 
 function isInPeriod(date, view) {
@@ -951,7 +1059,6 @@ function App() {
   const [clientDraft, setClientDraft] = useState(emptyClient());
   const [toast, setToast] = useState(null); // { id, message, action }
   const toastTimer = useRef(null);
-  const [importResult, setImportResult] = useState(null);
 
   const driveData = useMemo(
     () => ({ settings, clients, groups, sessions, groupSessions, charges, payments }),
@@ -1429,14 +1536,11 @@ function App() {
     downloadFile('quietadmin-clients.csv', toCsv(rows), 'text/csv');
   }
 
-  function importCsv(text) {
-    const { accepted, skipped, error } = importClientsCsv(text, clients);
-    if (!error && accepted.length) {
-      setClients((current) => [...current, ...accepted]);
-      setSelectedClientId(accepted[0].id);
-      showNotice(`Imported ${accepted.length} client${accepted.length === 1 ? '' : 's'}.`);
-    }
-    setImportResult({ imported: accepted.length, skipped, error });
+  function commitImportedClients(list) {
+    if (!list.length) return;
+    setClients((current) => [...current, ...list]);
+    setSelectedClientId(list[0].id);
+    showNotice(`Imported ${list.length} client${list.length === 1 ? '' : 's'}.`);
   }
 
   setActiveCurrency(settings.currency);
@@ -1457,7 +1561,6 @@ function App() {
 
   return (
     <main className={`${themeClass[settings.theme]} min-h-screen bg-[var(--bg)] text-[var(--text)]`}>
-      {importResult && <ImportSummary result={importResult} onClose={() => setImportResult(null)} />}
       <Toast toast={toast} onDismiss={dismissToast} />
       <div className="flex min-h-screen">
         <aside className="hidden w-72 shrink-0 border-r border-[var(--line)] bg-[var(--panel)] px-5 py-6 lg:block">
@@ -1554,7 +1657,7 @@ function App() {
                 addClient={addClient}
                 exportClientsCsv={exportClientsCsv}
                 exportJson={exportJson}
-                importCsv={importCsv}
+                onImport={commitImportedClients}
               />
             )}
 
@@ -1703,53 +1806,216 @@ function SetupScreen({ drive, onComplete }) {
   );
 }
 
-function ImportSummary({ result, onClose }) {
-  const { imported, skipped, error } = result;
+function ImportOverlay({ children, onClose }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-      <div className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-lg border border-[var(--line)] bg-[var(--panel)] p-5 shadow-soft">
-        <h2 className="text-xl font-semibold">{error ? 'Import failed' : 'Import complete'}</h2>
-        {error ? (
-          <p className="mt-2 text-sm text-[var(--accent)]">{error}</p>
-        ) : (
-          <>
-            <p className="mt-2 text-sm">
-              Imported <span className="font-semibold">{imported}</span> client{imported === 1 ? '' : 's'}
-              {skipped.length > 0 ? `, skipped ${skipped.length}.` : '.'}
-            </p>
-            {skipped.length > 0 && (
-              <div className="mt-3 overflow-hidden rounded-md border border-[var(--line)]">
-                <table className="w-full text-left text-sm">
-                  <thead className="bg-[var(--panel-muted)] text-xs uppercase text-[var(--subtle)]">
-                    <tr>
-                      <th className="px-3 py-2">Row</th>
-                      <th className="px-3 py-2">Name</th>
-                      <th className="px-3 py-2">Reason</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-[var(--line)]">
-                    {skipped.map((item, index) => (
-                      <tr key={`${item.row}-${index}`}>
-                        <td className="px-3 py-2 text-[var(--subtle)]">{item.row}</td>
-                        <td className="px-3 py-2">{item.name}</td>
-                        <td className="px-3 py-2 text-[var(--subtle)]">{item.reason}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </>
-        )}
-        <button
-          type="button"
-          className="mt-4 icon-button justify-center bg-[var(--primary)] text-white hover:bg-[var(--primary-dark)]"
-          onClick={onClose}
-        >
-          Done
-        </button>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
+      <div className="max-h-[88vh] w-full max-w-2xl overflow-y-auto rounded-lg border border-[var(--line)] bg-[var(--panel)] p-5 shadow-soft" onClick={(event) => event.stopPropagation()}>
+        {children}
       </div>
     </div>
+  );
+}
+
+function CloseX({ onClose }) {
+  return (
+    <button type="button" className="rounded-md p-1 text-[var(--subtle)] hover:bg-[var(--panel-muted)]" onClick={onClose} aria-label="Close">
+      <X size={18} />
+    </button>
+  );
+}
+
+function ClientImportWizard({ existingClients, onImport, onClose }) {
+  const fileRef = useRef(null);
+  const [raw, setRaw] = useState('');
+  const [paste, setPaste] = useState('');
+  const [hasHeader, setHasHeader] = useState(true);
+  const [mapping, setMapping] = useState([]);
+  const [result, setResult] = useState(null);
+
+  const rows = useMemo(() => (raw ? parseTable(raw).filter((row) => row.some((cell) => String(cell ?? '').trim() !== '')) : []), [raw]);
+
+  useEffect(() => {
+    if (!rows.length) { setMapping([]); return; }
+    setMapping(hasHeader ? autoMapColumns(rows[0]) : new Array(rows[0].length).fill(''));
+  }, [rows, hasHeader]);
+
+  const outcome = useMemo(
+    () => (rows.length && mapping.length ? runClientImport({ rows, mapping, hasHeader, existingClients }) : { accepted: [], skipped: [] }),
+    [rows, mapping, hasHeader, existingClients],
+  );
+  const warningRows = outcome.accepted.filter((entry) => entry.warnings.length);
+  const nameMapped = mapping.includes('name');
+
+  function loadRaw(text) {
+    if (!text.trim()) return;
+    setResult(null);
+    setHasHeader(true);
+    setRaw(text);
+  }
+  function handleFile(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => loadRaw(String(reader.result || ''));
+    reader.readAsText(file);
+    event.target.value = '';
+  }
+  function downloadTemplate(minimal) {
+    const template = minimal
+      ? [['Name', 'Email', 'Phone'], ['Jane Doe', 'jane@example.com', '+91 90000 00000']]
+      : [CLIENT_CSV_COLUMNS, CLIENT_CSV_EXAMPLE];
+    downloadFile(minimal ? 'quietadmin-template-basic.csv' : 'quietadmin-template-full.csv', toCsv(template), 'text/csv');
+  }
+  function doImport() {
+    if (!outcome.accepted.length) return;
+    onImport(outcome.accepted.map((entry) => entry.client));
+    setResult({ imported: outcome.accepted.length, skipped: outcome.skipped, warningRows });
+  }
+
+  // 1) Result
+  if (result) {
+    const warnings = result.warningRows.flatMap((entry) => entry.warnings.map((w) => ({ name: entry.client.name, w }))).slice(0, 8);
+    return (
+      <ImportOverlay onClose={onClose}>
+        <div className="flex items-start justify-between gap-3">
+          <h2 className="text-xl font-semibold">Import complete</h2>
+          <CloseX onClose={onClose} />
+        </div>
+        <p className="mt-2 text-sm">
+          Imported <span className="font-semibold">{result.imported}</span> client{result.imported === 1 ? '' : 's'}
+          {result.skipped.length ? `, skipped ${result.skipped.length}` : ''}
+          {result.warningRows.length ? `, ${result.warningRows.length} with minor fixes` : ''}.
+        </p>
+        {warnings.length > 0 && (
+          <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 p-3">
+            <p className="flex items-center gap-1.5 text-sm font-medium text-amber-800"><AlertTriangle size={14} /> Adjusted while importing</p>
+            <ul className="mt-1 space-y-0.5 text-xs text-amber-800">
+              {warnings.map((item, i) => <li key={i}>{item.name}: {item.w}</li>)}
+            </ul>
+          </div>
+        )}
+        {result.skipped.length > 0 && (
+          <div className="mt-3 overflow-hidden rounded-md border border-[var(--line)]">
+            <table className="w-full text-left text-sm">
+              <thead className="bg-[var(--panel-muted)] text-xs uppercase text-[var(--subtle)]">
+                <tr><th className="px-3 py-2">Row</th><th className="px-3 py-2">Name</th><th className="px-3 py-2">Reason</th></tr>
+              </thead>
+              <tbody className="divide-y divide-[var(--line)]">
+                {result.skipped.map((item, index) => (
+                  <tr key={`${item.row}-${index}`}>
+                    <td className="px-3 py-2 text-[var(--subtle)]">{item.row}</td>
+                    <td className="px-3 py-2">{item.name}</td>
+                    <td className="px-3 py-2 text-[var(--subtle)]">{item.reason}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <button type="button" className="mt-4 icon-button justify-center bg-[var(--primary)] text-white hover:bg-[var(--primary-dark)]" onClick={onClose}>Done</button>
+      </ImportOverlay>
+    );
+  }
+
+  // 2) Source — choose a file or paste
+  if (!rows.length) {
+    return (
+      <ImportOverlay onClose={onClose}>
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h2 className="text-xl font-semibold">Import clients</h2>
+            <p className="mt-1 text-sm text-[var(--subtle)]">Only a <span className="font-medium">Name</span> is required. Bring any spreadsheet — we’ll match your columns and fill sensible defaults.</p>
+          </div>
+          <CloseX onClose={onClose} />
+        </div>
+        <input ref={fileRef} type="file" accept=".csv,.tsv,text/csv,text/tab-separated-values" className="hidden" onChange={handleFile} />
+        <button type="button" className="mt-4 icon-button justify-center bg-[var(--primary)] text-white hover:bg-[var(--primary-dark)]" onClick={() => fileRef.current?.click()}>
+          <Import size={17} /> Upload a CSV file
+        </button>
+        <div className="mt-4">
+          <p className="text-sm font-medium text-[var(--subtle)]">…or paste rows from Excel / Google Sheets</p>
+          <textarea
+            value={paste}
+            onChange={(event) => setPaste(event.target.value)}
+            rows={4}
+            placeholder={'Name\tEmail\tPhone\nJane Doe\tjane@example.com\t+91 90000 00000'}
+            className="mt-1 w-full rounded-md border border-[var(--line)] bg-[var(--panel)] px-3 py-2 text-sm text-[var(--text)]"
+          />
+          <button type="button" className="mt-2 icon-button" onClick={() => loadRaw(paste)} disabled={!paste.trim()}>Use pasted rows</button>
+        </div>
+        <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-[var(--line)] pt-3 text-sm text-[var(--subtle)]">
+          <span>Templates:</span>
+          <button type="button" className="inline-flex items-center gap-1 font-medium text-[var(--primary)] hover:underline" onClick={() => downloadTemplate(true)}><Download size={14} /> Basic</button>
+          <button type="button" className="inline-flex items-center gap-1 font-medium text-[var(--primary)] hover:underline" onClick={() => downloadTemplate(false)}><Download size={14} /> Full</button>
+        </div>
+      </ImportOverlay>
+    );
+  }
+
+  // 3) Map columns + preview
+  const sampleRow = hasHeader ? rows[1] || [] : rows[0];
+  const dupFields = mapping.filter((key, i) => key && mapping.indexOf(key) !== i);
+  return (
+    <ImportOverlay onClose={onClose}>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-xl font-semibold">Match your columns</h2>
+          <p className="mt-1 text-sm text-[var(--subtle)]">{rows.length - (hasHeader ? 1 : 0)} row(s) detected. Confirm how each column maps.</p>
+        </div>
+        <CloseX onClose={onClose} />
+      </div>
+
+      <label className="mt-3 flex w-fit items-center gap-2 text-sm text-[var(--subtle)]">
+        <input type="checkbox" className="h-4 w-4 accent-[var(--primary)]" checked={hasHeader} onChange={(event) => setHasHeader(event.target.checked)} />
+        First row is a header
+      </label>
+
+      <div className="mt-3 max-h-64 space-y-1.5 overflow-auto scrollbar-soft rounded-md border border-[var(--line)] bg-[var(--bg)] p-2">
+        {rows[0].map((cell, i) => (
+          <div key={i} className="flex items-center gap-2 rounded px-2 py-1.5">
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-medium">{hasHeader ? cell || `Column ${i + 1}` : `Column ${i + 1}`}</p>
+              <p className="truncate text-xs text-[var(--subtle)]">{String(sampleRow[i] ?? '') || '—'}</p>
+            </div>
+            <select
+              value={mapping[i] || ''}
+              onChange={(event) => setMapping((current) => { const next = [...current]; next[i] = event.target.value; return next; })}
+              className="shrink-0 rounded-md border border-[var(--line)] bg-[var(--panel)] px-2 py-1.5 text-sm text-[var(--text)]"
+            >
+              <option value="">Ignore</option>
+              {IMPORT_FIELDS.map((field) => <option key={field.key} value={field.key}>{field.label}</option>)}
+            </select>
+          </div>
+        ))}
+      </div>
+
+      {!nameMapped && (
+        <p className="mt-3 flex items-center gap-1.5 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-700">
+          <AlertTriangle size={14} /> Map a column to <span className="font-semibold">Name</span> to import.
+        </p>
+      )}
+      {dupFields.length > 0 && (
+        <p className="mt-2 text-xs text-[var(--subtle)]">Two columns map to the same field ({dupFields.map((k) => IMPORT_FIELD_BY_KEY[k].label).join(', ')}); the first is used.</p>
+      )}
+
+      <p className="mt-3 text-sm">
+        Ready to import <span className="font-semibold">{outcome.accepted.length}</span>
+        {outcome.skipped.length ? ` · ${outcome.skipped.length} skipped` : ''}
+        {warningRows.length ? ` · ${warningRows.length} auto-fixed` : ''}.
+      </p>
+
+      <div className="mt-4 flex justify-end gap-2">
+        <button type="button" className="icon-button" onClick={() => setRaw('')}>Back</button>
+        <button
+          type="button"
+          className="icon-button bg-[var(--primary)] text-white hover:bg-[var(--primary-dark)] disabled:opacity-50"
+          onClick={doImport}
+          disabled={outcome.accepted.length === 0}
+        >
+          <Check size={16} /> Import {outcome.accepted.length} client{outcome.accepted.length === 1 ? '' : 's'}
+        </button>
+      </div>
+    </ImportOverlay>
   );
 }
 
@@ -2450,19 +2716,10 @@ function SessionModal({ session, client, ledger, statusSession, undoSession, res
   );
 }
 
-function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessions, charges, payments, allocation, updateClient, updateCharge, deleteCharge, clientTab, setClientTab, clientDraft, setClientDraft, addClient, exportClientsCsv, exportJson, importCsv }) {
-  const fileInputRef = useRef(null);
+function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessions, charges, payments, allocation, updateClient, updateCharge, deleteCharge, clientTab, setClientTab, clientDraft, setClientDraft, addClient, exportClientsCsv, exportJson, onImport }) {
   const [editingClient, setEditingClient] = useState(null);
   const [editingCharge, setEditingCharge] = useState(null);
-
-  function handleFile(event) {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => importCsv(String(reader.result || ''));
-    reader.readAsText(file);
-    event.target.value = ''; // allow re-importing the same file
-  }
+  const [importOpen, setImportOpen] = useState(false);
 
   const selectedSessions = selectedClient ? sessions.filter((session) => session.clientId === selectedClient.id) : [];
   const selectedCharges = selectedClient ? charges.filter((charge) => charge.clientId === selectedClient.id) : [];
@@ -2484,10 +2741,9 @@ function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessio
             <p className="section-subtitle">Active, archived, billing and cancellation rules.</p>
           </div>
           <div className="flex flex-wrap gap-2">
-            <input ref={fileInputRef} type="file" accept=".csv,text/csv" className="hidden" onChange={handleFile} />
-            <button className="icon-button" type="button" onClick={() => fileInputRef.current?.click()}>
+            <button className="icon-button" type="button" onClick={() => setImportOpen(true)}>
               <Import size={17} />
-              Import CSV
+              Import
             </button>
             <button className="icon-button" type="button" onClick={exportClientsCsv}>
               <Download size={17} />
@@ -2656,6 +2912,13 @@ function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessio
         charge={editingCharge}
         onSave={updateCharge}
         onClose={() => setEditingCharge(null)}
+      />
+    )}
+    {importOpen && (
+      <ClientImportWizard
+        existingClients={clients}
+        onImport={onImport}
+        onClose={() => setImportOpen(false)}
       />
     )}
     </>
