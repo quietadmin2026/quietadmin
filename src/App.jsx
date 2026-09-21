@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
+  ArrowDownRight,
+  ArrowUpRight,
   Archive,
   BarChart3,
   CalendarDays,
@@ -22,6 +24,7 @@ import {
   ReceiptText,
   RefreshCcw,
   RotateCcw,
+  Search,
   Settings,
   Trash2,
   Users,
@@ -298,6 +301,11 @@ function monthKey(dateStr) {
 function monthLabel(period) {
   const [year, month] = period.split('-').map(Number);
   return new Date(year, month - 1, 1).toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
+}
+
+function monthShort(period) {
+  const [year, month] = period.split('-').map(Number);
+  return new Date(year, month - 1, 1).toLocaleDateString('en-IN', { month: 'short' });
 }
 
 function endOfMonthIso(period) {
@@ -1036,6 +1044,37 @@ function App() {
   // on the dashboard and week view, and checked before adding or rescheduling.
   const conflictIds = useMemo(() => findConflicts(sessions), [sessions]);
 
+  // Six-month practice trends for the dashboard: money (billed/collected) plus
+  // activity (attendance, sessions, late cancels), oldest month first.
+  const trends = useMemo(() => {
+    const periods = recentMonths(6, todayIso).slice().reverse();
+    return periods.map((period) => {
+      const eom = endOfMonthIso(period);
+      const inMonth = (date) => monthKey(date) === period;
+      const monthSessions = sessions.filter((session) => inMonth(session.date));
+      const attended = monthSessions.filter((session) => session.status === 'Present').length;
+      const chargesToEom = charges.filter((charge) => charge.date <= eom).reduce((sum, charge) => sum + charge.amount, 0);
+      const paymentsToEom = payments.filter((payment) => payment.date <= eom).reduce((sum, payment) => sum + payment.amount, 0);
+      return {
+        period,
+        label: monthShort(period),
+        billed: charges.filter((charge) => inMonth(charge.date)).reduce((sum, charge) => sum + charge.amount, 0),
+        collected: payments.filter((payment) => inMonth(payment.date)).reduce((sum, payment) => sum + payment.amount, 0),
+        attended,
+        sessions: monthSessions.length,
+        attendanceRate: monthSessions.length ? Math.round((attended / monthSessions.length) * 100) : 0,
+        lateCancels: monthSessions.filter((session) => session.status === 'Late Cancel').length,
+        outstanding: Math.max(chargesToEom - paymentsToEom, 0),
+      };
+    });
+  }, [sessions, charges, payments]);
+
+  const goToClient = useCallback((id) => {
+    setSelectedClientId(id);
+    setClientTab('Overview');
+    setActiveNav('Clients');
+  }, []);
+
   const visibleSessions = useMemo(
     () => sessions.filter((session) => isInPeriod(session.date, view)).sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`)),
     [sessions, view],
@@ -1461,8 +1500,11 @@ function App() {
                 setView={setView}
                 sessions={visibleSessions}
                 clients={clientById}
+                clientList={clients}
                 ledgerByClient={ledgerByClient}
                 conflictIds={conflictIds}
+                trends={trends}
+                goToClient={goToClient}
                 stats={{
                   today: sessions.filter((session) => session.date === todayIso).length,
                   outstanding: totalOutstanding,
@@ -1808,7 +1850,243 @@ function MobileNav({ activeNav, setActiveNav }) {
   );
 }
 
-function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient, conflictIds, stats, statusSession, undoSession, reschedule, removeSession, addSession, setPaymentDraft, setActiveNav }) {
+// Catmull-Rom → cubic bezier, for calm curves through the data points.
+function buildSmoothPath(points) {
+  if (points.length === 0) return '';
+  if (points.length === 1) return `M ${points[0].x},${points[0].y}`;
+  let d = `M ${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`;
+  for (let i = 0; i < points.length - 1; i += 1) {
+    const p0 = points[i - 1] || points[i];
+    const p1 = points[i];
+    const p2 = points[i + 1];
+    const p3 = points[i + 2] || p2;
+    const c1x = p1.x + (p2.x - p0.x) / 6;
+    const c1y = p1.y + (p2.y - p0.y) / 6;
+    const c2x = p2.x - (p3.x - p1.x) / 6;
+    const c2y = p2.y - (p3.y - p1.y) / 6;
+    d += ` C ${c1x.toFixed(1)},${c1y.toFixed(1)} ${c2x.toFixed(1)},${c2y.toFixed(1)} ${p2.x.toFixed(1)},${p2.y.toFixed(1)}`;
+  }
+  return d;
+}
+
+// Month-over-month change for a trend tile. `mode` is 'pct' (relative) or
+// 'points' (absolute, for percentages); `goodUp` says whether rising is good,
+// which sets the colour independently of the arrow direction.
+function deltaInfo(series, { mode, goodUp }) {
+  const last = series[series.length - 1] || 0;
+  const prev = series[series.length - 2] || 0;
+  const diff = last - prev;
+  if (mode === 'points') {
+    if (diff === 0) return { delta: 'No change', tone: 'flat' };
+    return { delta: `${diff > 0 ? '+' : ''}${diff} pts`, tone: (diff > 0) === goodUp ? 'up' : 'down', increased: diff > 0 };
+  }
+  if (prev === 0) {
+    if (last === 0) return { delta: 'No change', tone: 'flat' };
+    return { delta: 'New', tone: goodUp ? 'up' : 'down', increased: true };
+  }
+  const pct = Math.round((diff / prev) * 100);
+  if (pct === 0) return { delta: 'No change', tone: 'flat' };
+  return { delta: `${pct > 0 ? '+' : ''}${pct}%`, tone: (pct > 0) === goodUp ? 'up' : 'down', increased: pct > 0 };
+}
+
+function Sparkline({ values }) {
+  const w = 88;
+  const h = 30;
+  const pad = 3;
+  const max = Math.max(1, ...values);
+  const n = values.length;
+  const points = values.map((v, i) => ({
+    x: pad + (w - 2 * pad) * (n > 1 ? i / (n - 1) : 0.5),
+    y: pad + (h - 2 * pad) * (1 - v / max),
+  }));
+  const last = points[points.length - 1];
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} width={w} height={h} className="shrink-0" aria-hidden="true">
+      <path d={buildSmoothPath(points)} fill="none" style={{ stroke: 'var(--primary)' }} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+      {last && <circle cx={last.x} cy={last.y} r="2.5" style={{ fill: 'var(--primary)' }} />}
+    </svg>
+  );
+}
+
+function TrendTile({ label, value, series, delta, tone, increased }) {
+  const toneClass =
+    tone === 'up'
+      ? 'text-emerald-700 bg-emerald-50 border-emerald-200'
+      : tone === 'down'
+        ? 'text-red-700 bg-red-50 border-red-200'
+        : 'text-[var(--subtle)] bg-[var(--panel-muted)] border-[var(--line)]';
+  const Arrow = increased ? ArrowUpRight : ArrowDownRight;
+  return (
+    <div className="rounded-md border border-[var(--line)] bg-[var(--bg)] p-3">
+      <p className="text-xs font-semibold uppercase tracking-wide text-[var(--subtle)]">{label}</p>
+      <div className="mt-1 flex items-end justify-between gap-2">
+        <p className="text-2xl font-semibold leading-none">{value}</p>
+        <Sparkline values={series} />
+      </div>
+      <span className={`mt-2 inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-xs font-medium ${toneClass}`}>
+        {tone !== 'flat' && <Arrow size={12} />}
+        {delta}
+      </span>
+    </div>
+  );
+}
+
+function TrendChart({ data }) {
+  const W = 640;
+  const H = 200;
+  const padL = 16;
+  const padR = 18;
+  const padT = 28;
+  const padB = 26;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+  const n = data.length;
+  const collected = data.map((d) => d.collected);
+  const billed = data.map((d) => d.billed);
+  const max = Math.max(1, ...collected, ...billed);
+  const xAt = (i) => padL + (n > 1 ? (plotW * i) / (n - 1) : plotW / 2);
+  const yAt = (v) => padT + plotH * (1 - v / max);
+  const cPts = collected.map((v, i) => ({ x: xAt(i), y: yAt(v) }));
+  const bPts = billed.map((v, i) => ({ x: xAt(i), y: yAt(v) }));
+  const cLine = buildSmoothPath(cPts);
+  const baseline = padT + plotH;
+  const area = cPts.length ? `${cLine} L ${cPts[cPts.length - 1].x.toFixed(1)},${baseline} L ${cPts[0].x.toFixed(1)},${baseline} Z` : '';
+  const gridY = [0, max / 2, max].map((v) => yAt(v));
+  const lastC = cPts[cPts.length - 1];
+  const lastVal = collected[collected.length - 1] || 0;
+  const labelX = Math.min(Math.max(lastC?.x || 0, padL + 28), W - padR - 28);
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label="Collected and billed revenue over the last six months">
+      <defs>
+        <linearGradient id="qaTrendFill" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" style={{ stopColor: 'var(--primary)', stopOpacity: 0.2 }} />
+          <stop offset="100%" style={{ stopColor: 'var(--primary)', stopOpacity: 0 }} />
+        </linearGradient>
+      </defs>
+      {gridY.map((yy, i) => (
+        <line key={yy} x1={padL} y1={yy} x2={W - padR} y2={yy} style={{ stroke: 'var(--line)' }} strokeWidth="1" opacity={i === 0 ? 0.9 : 0.45} />
+      ))}
+      {area && <path d={area} fill="url(#qaTrendFill)" />}
+      {buildSmoothPath(bPts) && (
+        <path d={buildSmoothPath(bPts)} fill="none" style={{ stroke: 'var(--accent)' }} strokeWidth="1.5" strokeDasharray="4 4" strokeLinecap="round" opacity="0.75" />
+      )}
+      {cLine && <path d={cLine} fill="none" style={{ stroke: 'var(--primary)' }} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />}
+      {lastC && (
+        <>
+          <circle cx={lastC.x} cy={lastC.y} r="6" style={{ fill: 'var(--panel)' }} />
+          <circle cx={lastC.x} cy={lastC.y} r="3.5" style={{ fill: 'var(--primary)' }} />
+          <text x={labelX} y={Math.max(lastC.y - 12, 12)} textAnchor="middle" style={{ fill: 'var(--text)' }} fontSize="12" fontWeight="600">
+            {formatMoney(lastVal)}
+          </text>
+        </>
+      )}
+      {data.map((d, i) => (
+        <text key={d.period} x={xAt(i)} y={H - 8} textAnchor="middle" style={{ fill: 'var(--subtle)' }} fontSize="10" letterSpacing="0.06em">
+          {d.label.toUpperCase()}
+        </text>
+      ))}
+    </svg>
+  );
+}
+
+function TrendsPanel({ trends }) {
+  const last = trends[trends.length - 1] || {};
+  const tiles = [
+    { label: 'Attendance', value: `${last.attendanceRate || 0}%`, series: trends.map((t) => t.attendanceRate), ...deltaInfo(trends.map((t) => t.attendanceRate), { mode: 'points', goodUp: true }) },
+    { label: 'Sessions attended', value: last.attended || 0, series: trends.map((t) => t.attended), ...deltaInfo(trends.map((t) => t.attended), { mode: 'pct', goodUp: true }) },
+    { label: 'Late cancellations', value: last.lateCancels || 0, series: trends.map((t) => t.lateCancels), ...deltaInfo(trends.map((t) => t.lateCancels), { mode: 'pct', goodUp: false }) },
+  ];
+  return (
+    <Panel>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h3 className="section-title">Trends</h3>
+          <p className="section-subtitle">Revenue and activity over the last 6 months</p>
+        </div>
+        <div className="flex items-center gap-4 text-xs text-[var(--subtle)]">
+          <span className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-full" style={{ background: 'var(--primary)' }} />Collected</span>
+          <span className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-full" style={{ background: 'var(--accent)' }} />Billed</span>
+        </div>
+      </div>
+      <div className="mt-4">
+        <TrendChart data={trends} />
+      </div>
+      <div className="mt-5 grid gap-3 sm:grid-cols-3">
+        {tiles.map((tile) => <TrendTile key={tile.label} {...tile} />)}
+      </div>
+    </Panel>
+  );
+}
+
+function ClientSearch({ clientList, ledgerByClient, goToClient }) {
+  const [query, setQuery] = useState('');
+  const trimmed = query.trim().toLowerCase();
+  const results = trimmed
+    ? clientList
+        .filter((client) =>
+          [client.name, client.email, client.phone, ...(client.tags || [])]
+            .filter(Boolean)
+            .some((field) => String(field).toLowerCase().includes(trimmed)),
+        )
+        .slice(0, 6)
+    : [];
+
+  function choose(id) {
+    setQuery('');
+    goToClient(id);
+  }
+
+  return (
+    <div className="relative">
+      <div className="flex items-center gap-2 rounded-lg border border-[var(--line)] bg-[var(--panel)] px-3 py-2.5 shadow-soft">
+        <Search size={17} className="shrink-0 text-[var(--subtle)]" />
+        <input
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && results[0]) choose(results[0].id);
+            if (event.key === 'Escape') setQuery('');
+          }}
+          placeholder="Search clients by name, email, phone or tag…"
+          className="w-full bg-transparent text-sm text-[var(--text)] outline-none placeholder:text-[var(--subtle)]"
+          aria-label="Search clients"
+        />
+        {query && (
+          <button type="button" className="shrink-0 text-[var(--subtle)] hover:text-[var(--text)]" onClick={() => setQuery('')} aria-label="Clear search">
+            <X size={16} />
+          </button>
+        )}
+      </div>
+      {trimmed && (
+        <div className="absolute z-30 mt-2 w-full overflow-hidden rounded-lg border border-[var(--line)] bg-[var(--panel)] shadow-soft">
+          {results.length === 0 ? (
+            <p className="px-4 py-3 text-sm text-[var(--subtle)]">No clients match “{query}”.</p>
+          ) : (
+            results.map((client) => {
+              const outstanding = ledgerByClient[client.id]?.outstanding || 0;
+              return (
+                <button
+                  key={client.id}
+                  type="button"
+                  onClick={() => choose(client.id)}
+                  className="flex w-full items-center justify-between gap-3 px-4 py-2.5 text-left transition hover:bg-[var(--panel-muted)]"
+                >
+                  <span className="min-w-0">
+                    <span className="block truncate text-sm font-medium">{client.name}</span>
+                    <span className="block truncate text-xs text-[var(--subtle)]">{client.email || client.phone || client.type}</span>
+                  </span>
+                  <span className="shrink-0 text-xs text-[var(--subtle)]">{outstanding > 0 ? `${formatMoney(outstanding)} due` : client.status}</span>
+                </button>
+              );
+            })
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Dashboard({ settings, view, setView, sessions, clients, clientList, ledgerByClient, conflictIds, trends, goToClient, stats, statusSession, undoSession, reschedule, removeSession, addSession, setPaymentDraft, setActiveNav }) {
   const outstandingClients = Object.values(clients).filter((client) => ledgerByClient[client.id]?.outstanding > 0);
   const activeClients = Object.values(clients).filter((client) => client.status === 'Active');
   const [adding, setAdding] = useState(false);
@@ -1826,6 +2104,7 @@ function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient,
 
   return (
     <div className="space-y-5">
+      <ClientSearch clientList={clientList} ledgerByClient={ledgerByClient} goToClient={goToClient} />
       {settings.outstandingReminders && outstandingClients.length > 0 && (
         <button
           type="button"
@@ -1845,6 +2124,8 @@ function Dashboard({ settings, view, setView, sessions, clients, ledgerByClient,
         <StatCard title="Collected This Month" value={formatMoney(stats.collected)} icon={CreditCard} />
         <StatCard title="Late Cancellations This Month" value={stats.lateCancels} icon={Clock3} />
       </div>
+
+      <TrendsPanel trends={trends} />
 
       <section className="grid gap-5 xl:grid-cols-[1.35fr_0.9fr]">
         <Panel>
