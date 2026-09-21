@@ -1550,21 +1550,25 @@ function App() {
   }
 
   // Set one member's attendance on a group session. Marking Present bills them
-  // the group's session fee (for Per Session groups, when auto-charges are on);
-  // any other status — or clearing — drops that bill. status null clears the mark.
+  // for a Per Session group when auto-charges are on: each member is charged their
+  // own session rate, falling back to the group's fee when they have no rate set —
+  // so the group fee is just a default, and per-client amounts are honored.
+  // Any other status — or clearing — drops that bill. status null clears the mark.
   function markGroupAttendance(sessionId, clientId, status) {
     const gs = groupSessions.find((item) => item.id === sessionId);
     if (!gs) return;
     const group = groupById[gs.groupId];
     const prior = gs.attendance?.[clientId] || {};
-    const bills = settings.autoCreateCharges && group?.billingModel === 'Per Session' && Number(group?.sessionFee) > 0;
+    const memberRate = Number(clientById[clientId]?.sessionRate) || 0;
+    const fee = memberRate > 0 ? memberRate : Number(group?.sessionFee) || 0;
+    const bills = settings.autoCreateCharges && group?.billingModel === 'Per Session' && fee > 0;
 
     let newChargeId = prior.chargeId || null;
     let addCharge = null;
     let removeChargeId = null;
     if (status === 'Present') {
       if (bills && !prior.chargeId) {
-        addCharge = { id: `ch${Date.now()}`, clientId, date: gs.date, amount: Number(group.sessionFee), reason: 'Group Session', status: 'Pending' };
+        addCharge = { id: `ch${Date.now()}`, clientId, date: gs.date, amount: fee, reason: 'Group Session', status: 'Pending' };
         newChargeId = addCharge.id;
       }
     } else if (prior.chargeId) {
@@ -3321,7 +3325,7 @@ function Groups({ groups, clients, clientList, groupSessions, settings, today, a
               </div>
               <div className="mt-4 grid gap-3 sm:grid-cols-3">
                 <MiniMetric label="Billing" value={selected.billingModel} />
-                <MiniMetric label="Session Fee" value={formatMoney(selected.sessionFee)} />
+                <MiniMetric label="Default Fee" value={formatMoney(selected.sessionFee)} />
                 <MiniMetric label="Members" value={`${selected.members.length}/${selected.capacity}`} />
               </div>
               {(() => {
@@ -3343,7 +3347,7 @@ function Groups({ groups, clients, clientList, groupSessions, settings, today, a
               </div>
 
               <h4 className="mt-6 font-semibold">Sessions</h4>
-              <p className="mt-1 text-sm text-[var(--subtle)]">Marking a member present bills the session fee. Auto charge is {settings.autoCreateCharges ? 'on' : 'off'}.</p>
+              <p className="mt-1 text-sm text-[var(--subtle)]">Marking a member present bills their own session rate, or the group fee if they have none. Auto charge is {settings.autoCreateCharges ? 'on' : 'off'}.</p>
               <form onSubmit={submitSession} className="mt-3 grid gap-3 rounded-md border border-[var(--line)] bg-[var(--bg)] p-3 sm:grid-cols-4">
                 <Input label="Date" type="date" value={draft.date} onChange={(value) => setDraft((current) => ({ ...current, date: value }))} />
                 <Input label="Time" type="time" value={draft.time} onChange={(value) => setDraft((current) => ({ ...current, time: value }))} />
@@ -3438,8 +3442,9 @@ function GroupEditModal({ group, clientList, isNew, onSave, onClose }) {
           <Select label="Type" value={draft.type} options={['Therapy', 'Supervision', 'Support', 'Other']} onChange={(value) => set({ type: value })} />
           <Input label="Capacity" type="number" value={draft.capacity} onChange={(value) => set({ capacity: value })} />
           <Select label="Billing Model" value={draft.billingModel} options={['Per Session', 'Subscription']} onChange={(value) => set({ billingModel: value })} />
-          <Input label="Session Fee" type="number" value={draft.sessionFee} onChange={(value) => set({ sessionFee: value })} />
+          <Input label="Default Session Fee" type="number" value={draft.sessionFee} onChange={(value) => set({ sessionFee: value })} />
         </div>
+        <p className="mt-1 text-xs text-[var(--subtle)]">Each member is billed their own session rate; this fee is used only for members with no rate set.</p>
         <div className="mt-3 rounded-md border border-[var(--line)] bg-[var(--bg)] p-3">
           <label className="flex items-center gap-2 text-sm font-medium">
             <input type="checkbox" className="h-4 w-4 accent-[var(--primary)]" checked={!!draft.recurring} onChange={(event) => set({ recurring: event.target.checked })} />
