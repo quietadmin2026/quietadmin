@@ -910,6 +910,56 @@ function reconcileRecurringSessions(clients, sessions, today) {
   return kept.concat(additions);
 }
 
+// Materialize weekly group meetings the same way individual recurring sessions
+// work: for each Active group flagged recurring (with a day + time), fill in a
+// group session for each occurrence from today through the horizon. Only auto,
+// still-future, *unmarked* group sessions are pruned when a group stops
+// recurring or moves its slot — once anyone's attendance is marked (and charges
+// may exist) the meeting is left alone. Same-ref when nothing changes.
+function reconcileGroupSessions(groups, groupSessions, today) {
+  const horizonEnd = isoAddDays(today, RECURRING_HORIZON_DAYS);
+  const groupById = Object.fromEntries(groups.map((group) => [group.id, group]));
+  const matchesSlot = (group, session) =>
+    group && group.status === 'Active' && group.recurring && group.day && group.time
+    && group.time === session.time && WEEKDAYS[toDate(session.date).getDay()] === group.day;
+
+  const kept = groupSessions.filter((session) => {
+    const unmarked = Object.keys(session.attendance || {}).length === 0;
+    const prunable = session.auto && unmarked && session.date >= today;
+    if (!prunable) return true;
+    return matchesSlot(groupById[session.groupId], session);
+  });
+
+  const existing = new Set(kept.map((session) => `${session.groupId}|${session.date}|${session.time}`));
+  const additions = [];
+  for (const group of groups) {
+    if (group.status !== 'Active' || !group.recurring || !group.day || !group.time) continue;
+    const targetDow = WEEKDAYS.indexOf(group.day);
+    if (targetDow < 0) continue;
+    const cursor = toDate(today);
+    while (cursor.getDay() !== targetDow) cursor.setDate(cursor.getDate() + 1);
+    for (; ; cursor.setDate(cursor.getDate() + 7)) {
+      const iso = isoOf(cursor);
+      if (iso > horizonEnd) break;
+      const key = `${group.id}|${iso}|${group.time}`;
+      if (existing.has(key)) continue;
+      existing.add(key);
+      additions.push({
+        id: `gauto-${group.id}-${iso}-${group.time}`,
+        groupId: group.id,
+        date: iso,
+        time: group.time,
+        duration: Number(group.duration) || 60,
+        attendance: {},
+        auto: true,
+      });
+    }
+  }
+
+  if (additions.length === 0 && kept.length === groupSessions.length) return groupSessions;
+  return kept.concat(additions);
+}
+
 // Cap how far back a subscription client can be auto-billed on first run, so an
 // old joining date can't suddenly generate years of charges.
 const SUBSCRIPTION_BACKFILL_MONTHS = 12;
@@ -1046,13 +1096,13 @@ function sessionsClash(a, b) {
   return aStart < bStart + (Number(b.duration) || 60) && bStart < aStart + (Number(a.duration) || 60);
 }
 
-// Set of session ids that overlap at least one other occupying session. Grouped
-// by date so the pairwise scan stays tiny for a solo practice.
-function findConflicts(sessions) {
+// Set of block ids that overlap at least one other block on the same day. Blocks
+// are pre-normalized occupancies ({ id, date, time, duration }) — one per 1:1
+// session and one per group meeting (a whole group is a single block, so its
+// members never clash with each other). Grouped by date to keep the scan tiny.
+function findConflicts(blocks) {
   const byDate = {};
-  for (const session of sessions) {
-    if (occupiesSlot(session)) (byDate[session.date] ||= []).push(session);
-  }
+  for (const block of blocks) (byDate[block.date] ||= []).push(block);
   const ids = new Set();
   for (const list of Object.values(byDate)) {
     for (let i = 0; i < list.length; i += 1) {
@@ -1067,10 +1117,11 @@ function findConflicts(sessions) {
   return ids;
 }
 
-// The first existing occupying session a candidate {date,time,duration} would
-// clash with, skipping the session being moved. Null when the slot is free.
-function firstClash(sessions, candidate, ignoreId) {
-  return sessions.find((session) => session.id !== ignoreId && occupiesSlot(session) && sessionsClash(session, candidate)) || null;
+// The first existing block a candidate {date,time,duration} would clash with,
+// skipping the one being moved. Returns the block (which carries a `label` for
+// the warning) or null when the slot is free.
+function firstClash(blocks, candidate, ignoreId) {
+  return blocks.find((block) => block.id !== ignoreId && sessionsClash(block, candidate)) || null;
 }
 
 function App() {
@@ -1140,6 +1191,11 @@ function App() {
     setCharges((current) => reconcileSubscriptionCharges(clients, current, settings.autoCreateCharges, today));
   }, [clients, settings.autoCreateCharges, today, setCharges]);
 
+  // Materialize recurring group meetings, mirroring the individual engine.
+  useEffect(() => {
+    setGroupSessions((current) => reconcileGroupSessions(groups, current, today));
+  }, [groups, today, setGroupSessions]);
+
   const ledgers = useMemo(() => {
     return clients.map((client) => {
       const totalCharges = charges.filter((charge) => charge.clientId === client.id).reduce((sum, charge) => sum + charge.amount, 0);
@@ -1178,9 +1234,26 @@ function App() {
     return { byCharge, openByClient };
   }, [clients, charges, payments]);
 
-  // Sessions that overlap another occupying session on the same day — surfaced
-  // on the dashboard and week view, and checked before adding or rescheduling.
-  const conflictIds = useMemo(() => findConflicts(sessions), [sessions]);
+  // One occupancy block per 1:1 session and per group meeting (a whole group is
+  // a single block, so its members never clash with each other). Each block
+  // carries a label used in the "overlaps X" warning. Powers both the conflict
+  // highlighting and the add/reschedule checks.
+  const occupancyBlocks = useMemo(() => {
+    const blocks = [];
+    for (const session of sessions) {
+      if (occupiesSlot(session)) {
+        blocks.push({ id: session.id, date: session.date, time: session.time, duration: session.duration, label: clientById[session.clientId]?.name || 'Session' });
+      }
+    }
+    for (const gs of groupSessions) {
+      blocks.push({ id: gs.id, date: gs.date, time: gs.time, duration: gs.duration, label: groupById[gs.groupId]?.name || 'Group' });
+    }
+    return blocks;
+  }, [sessions, groupSessions, clientById, groupById]);
+
+  // Ids of blocks that overlap another on the same day — surfaced on the
+  // dashboard and week view, and checked before adding or rescheduling.
+  const conflictIds = useMemo(() => findConflicts(occupancyBlocks), [occupancyBlocks]);
 
   // Six-month practice trends for the dashboard: money (billed/collected) plus
   // activity (attendance, sessions, late cancels), oldest month first.
@@ -1295,9 +1368,8 @@ function App() {
   // Human-readable warning naming the session a candidate slot would collide
   // with, ending in the caller's verb (e.g. "Add anyway?", "Move anyway?").
   function clashPrompt(clash, question) {
-    const other = clientById[clash.clientId];
     const when = formatDate(clash.date, { weekday: 'short', day: '2-digit', month: 'short' });
-    return `This overlaps ${other?.name || 'another session'} at ${clash.time} on ${when}. ${question}`;
+    return `This overlaps ${clash.label || 'another session'} at ${clash.time} on ${when}. ${question}`;
   }
 
   function reschedule(sessionId, newDate, newTime) {
@@ -1310,7 +1382,7 @@ function App() {
       date = fallback.toISOString().slice(0, 10);
     }
     const time = newTime || session.time;
-    const clash = firstClash(sessions, { date, time, duration: session.duration }, sessionId);
+    const clash = firstClash(occupancyBlocks, { date, time, duration: session.duration }, sessionId);
     if (clash && !window.confirm(clashPrompt(clash, 'Move anyway?'))) return;
     const replacement = {
       ...session,
@@ -1342,7 +1414,7 @@ function App() {
   function addSession(draft) {
     if (!draft.clientId || !draft.date || !draft.time) return false;
     const client = clientById[draft.clientId];
-    const clash = firstClash(sessions, { date: draft.date, time: draft.time, duration: Number(draft.duration) || 60 }, null);
+    const clash = firstClash(occupancyBlocks, { date: draft.date, time: draft.time, duration: Number(draft.duration) || 60 }, null);
     if (clash && !window.confirm(clashPrompt(clash, 'Add anyway?'))) return false;
     setSessions((current) => [
       ...current,
@@ -1450,6 +1522,8 @@ function App() {
   function addGroupSession(draft) {
     if (!draft.groupId || !draft.date || !draft.time) return false;
     const group = groupById[draft.groupId];
+    const clash = firstClash(occupancyBlocks, { date: draft.date, time: draft.time, duration: Number(draft.duration) || 60 }, null);
+    if (clash && !window.confirm(clashPrompt(clash, 'Add anyway?'))) return false;
     setGroupSessions((current) => [
       ...current,
       {
@@ -1663,6 +1737,10 @@ function App() {
                 ledgerByClient={ledgerByClient}
                 conflictIds={conflictIds}
                 today={today}
+                groupSessions={groupSessions}
+                groupById={groupById}
+                markGroupAttendance={markGroupAttendance}
+                removeGroupSession={removeGroupSession}
                 statusSession={statusSession}
                 undoSession={undoSession}
                 reschedule={reschedule}
@@ -2576,24 +2654,25 @@ const STATUS_TONE = {
   Rescheduled: { chip: 'border-[var(--line)] bg-[var(--panel-muted)] opacity-70', dot: 'bg-[var(--subtle)]' },
 };
 
-function Schedule({ sessions, clients, ledgerByClient, conflictIds, today, statusSession, undoSession, reschedule, removeSession }) {
+function Schedule({ sessions, clients, ledgerByClient, conflictIds, today, groupSessions, groupById, markGroupAttendance, removeGroupSession, statusSession, undoSession, reschedule, removeSession }) {
   const [weekStart, setWeekStart] = useState(() => startOfWeekIso(today));
   const [modalSession, setModalSession] = useState(null);
+  const [groupModalId, setGroupModalId] = useState(null);
 
   const days = Array.from({ length: 7 }, (_, i) => isoAddDays(weekStart, i));
   const weekEnd = days[6];
   const byDay = useMemo(() => {
     const map = Object.fromEntries(days.map((iso) => [iso, []]));
-    for (const session of sessions) {
-      if (session.date in map) map[session.date].push(session);
-    }
+    for (const session of sessions) if (session.date in map) map[session.date].push(session);
+    for (const gs of (groupSessions || [])) if (gs.date in map) map[gs.date].push(gs);
     for (const iso of days) map[iso].sort((a, b) => a.time.localeCompare(b.time));
     return map;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessions, weekStart]);
+  }, [sessions, groupSessions, weekStart]);
 
-  const weekConflicts = days.reduce((count, iso) => count + byDay[iso].filter((session) => conflictIds?.has(session.id)).length, 0);
+  const weekConflicts = days.reduce((count, iso) => count + byDay[iso].filter((item) => conflictIds?.has(item.id)).length, 0);
   const rangeLabel = `${formatDate(weekStart, { day: '2-digit', month: 'short' })} – ${formatDate(weekEnd, { day: '2-digit', month: 'short' })}`;
+  const modalGroup = groupModalId ? (groupSessions || []).find((gs) => gs.id === groupModalId) : null;
 
   return (
     <div className="space-y-5">
@@ -2601,7 +2680,7 @@ function Schedule({ sessions, clients, ledgerByClient, conflictIds, today, statu
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <h3 className="section-title">Schedule</h3>
-            <p className="section-subtitle">{rangeLabel} · tap a session to mark, reschedule or remove it.</p>
+            <p className="section-subtitle">{rangeLabel} · tap a session or group to mark, reschedule or remove it.</p>
             {weekConflicts > 0 && (
               <p className="mt-1 inline-flex items-center gap-1 text-sm font-medium text-red-700">
                 <AlertTriangle size={14} />
@@ -2636,21 +2715,39 @@ function Schedule({ sessions, clients, ledgerByClient, conflictIds, today, statu
                 </div>
                 <div className="space-y-2">
                   {dayed.length === 0 && <p className="px-1 py-3 text-center text-xs text-[var(--subtle)]">—</p>}
-                  {dayed.map((session) => {
-                    const client = clients[session.clientId];
+                  {dayed.map((item) => {
+                    const conflict = conflictIds?.has(item.id);
+                    if (item.groupId) {
+                      const group = groupById?.[item.groupId];
+                      return (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => setGroupModalId(item.id)}
+                          className={`w-full rounded-md border border-[var(--accent)] bg-[var(--accent-soft)] px-2 py-1.5 text-left transition hover:brightness-95${conflict ? ' ring-2 ring-red-400' : ''}`}
+                        >
+                          <span className="flex items-center gap-1.5">
+                            <Users size={12} className="shrink-0 text-[var(--accent)]" />
+                            <span className="text-xs font-semibold">{item.time}</span>
+                            {conflict && <AlertTriangle size={12} className="ml-auto shrink-0 text-red-600" />}
+                          </span>
+                          <span className="mt-0.5 block truncate text-sm font-medium">{group?.name || 'Group'}</span>
+                        </button>
+                      );
+                    }
+                    const client = clients[item.clientId];
                     if (!client) return null;
-                    const tone = STATUS_TONE[session.status] || STATUS_TONE.Scheduled;
-                    const conflict = conflictIds?.has(session.id);
+                    const tone = STATUS_TONE[item.status] || STATUS_TONE.Scheduled;
                     return (
                       <button
-                        key={session.id}
+                        key={item.id}
                         type="button"
-                        onClick={() => setModalSession(session)}
+                        onClick={() => setModalSession(item)}
                         className={`w-full rounded-md border px-2 py-1.5 text-left transition hover:brightness-95 ${tone.chip}${conflict ? ' ring-2 ring-red-400' : ''}`}
                       >
                         <span className="flex items-center gap-1.5">
                           <span className={`h-2 w-2 shrink-0 rounded-full ${tone.dot}`} />
-                          <span className="text-xs font-semibold">{session.time}</span>
+                          <span className="text-xs font-semibold">{item.time}</span>
                           {conflict && <AlertTriangle size={12} className="ml-auto shrink-0 text-red-600" />}
                         </span>
                         <span className="mt-0.5 block truncate text-sm font-medium">{client.name}</span>
@@ -2675,6 +2772,24 @@ function Schedule({ sessions, clients, ledgerByClient, conflictIds, today, statu
           removeSession={removeSession}
           onClose={() => setModalSession(null)}
         />
+      )}
+
+      {modalGroup && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setGroupModalId(null)}>
+          <div className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-lg border border-[var(--line)] bg-[var(--panel)] p-5 shadow-soft" onClick={(event) => event.stopPropagation()}>
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <h2 className="text-xl font-semibold">{groupById?.[modalGroup.groupId]?.name || 'Group'}</h2>
+              <CloseX onClose={() => setGroupModalId(null)} />
+            </div>
+            <GroupSessionCard
+              session={modalGroup}
+              group={groupById?.[modalGroup.groupId] || { members: [] }}
+              clients={clients}
+              onMark={markGroupAttendance}
+              onRemove={(id) => { removeGroupSession(id); setGroupModalId(null); }}
+            />
+          </div>
+        </div>
       )}
     </div>
   );
@@ -3084,7 +3199,7 @@ function ChargeEditModal({ charge, onSave, onClose }) {
 }
 
 function emptyGroup() {
-  return { name: '', type: 'Therapy', capacity: 8, billingModel: 'Per Session', sessionFee: 1200, schedule: '', status: 'Active', notes: '', members: [] };
+  return { name: '', type: 'Therapy', capacity: 8, billingModel: 'Per Session', sessionFee: 1200, schedule: '', status: 'Active', notes: '', members: [], recurring: false, day: '', time: '', duration: 90 };
 }
 
 function GroupSessionCard({ session, group, clients, onMark, onRemove }) {
@@ -3209,12 +3324,18 @@ function Groups({ groups, clients, clientList, groupSessions, settings, today, a
                 <MiniMetric label="Session Fee" value={formatMoney(selected.sessionFee)} />
                 <MiniMetric label="Members" value={`${selected.members.length}/${selected.capacity}`} />
               </div>
-              {(selected.schedule || selected.notes) && (
-                <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                  {selected.schedule && <InfoBlock title="Schedule" text={selected.schedule} />}
-                  {selected.notes && <InfoBlock title="Notes" text={selected.notes} />}
-                </div>
-              )}
+              {(() => {
+                const scheduleText = selected.recurring && selected.day && selected.time
+                  ? `Weekly · ${selected.day} ${selected.time} · ${selected.duration || 90} min`
+                  : selected.schedule;
+                if (!scheduleText && !selected.notes) return null;
+                return (
+                  <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                    {scheduleText && <InfoBlock title="Schedule" text={scheduleText} />}
+                    {selected.notes && <InfoBlock title="Notes" text={selected.notes} />}
+                  </div>
+                );
+              })()}
               <div className="mt-3 flex flex-wrap gap-2">
                 {selected.members.map((id) => (
                   <span key={id} className="rounded-md bg-[var(--panel-muted)] px-3 py-1.5 text-sm">{clients[id]?.name || 'Unknown'}</span>
@@ -3287,7 +3408,13 @@ function GroupEditModal({ group, clientList, isNew, onSave, onClose }) {
   function submit(event) {
     event.preventDefault();
     if (!String(draft.name).trim()) return;
-    onSave({ ...draft, name: String(draft.name).trim(), capacity: Number(draft.capacity) || 0, sessionFee: Number(draft.sessionFee) || 0 });
+    onSave({
+      ...draft,
+      name: String(draft.name).trim(),
+      capacity: Number(draft.capacity) || 0,
+      sessionFee: Number(draft.sessionFee) || 0,
+      duration: Number(draft.duration) || 90,
+    });
     onClose();
   }
 
@@ -3313,15 +3440,20 @@ function GroupEditModal({ group, clientList, isNew, onSave, onClose }) {
           <Select label="Billing Model" value={draft.billingModel} options={['Per Session', 'Subscription']} onChange={(value) => set({ billingModel: value })} />
           <Input label="Session Fee" type="number" value={draft.sessionFee} onChange={(value) => set({ sessionFee: value })} />
         </div>
-        <label className="mt-3 block">
-          <span className="text-sm font-medium text-[var(--subtle)]">Schedule (free text)</span>
-          <input
-            value={draft.schedule || ''}
-            onChange={(event) => set({ schedule: event.target.value })}
-            className="mt-1 w-full rounded-md border border-[var(--line)] bg-[var(--panel)] px-3 py-2 text-sm text-[var(--text)]"
-            placeholder="e.g. Every Tuesday, 6:00 PM, 90 minutes"
-          />
-        </label>
+        <div className="mt-3 rounded-md border border-[var(--line)] bg-[var(--bg)] p-3">
+          <label className="flex items-center gap-2 text-sm font-medium">
+            <input type="checkbox" className="h-4 w-4 accent-[var(--primary)]" checked={!!draft.recurring} onChange={(event) => set({ recurring: event.target.checked })} />
+            Recurring weekly
+          </label>
+          {draft.recurring && (
+            <div className="mt-3 grid gap-3 sm:grid-cols-3">
+              <Select label="Day" value={draft.day || ''} options={['', ...WEEKDAYS]} labels={{ '': '—' }} onChange={(value) => set({ day: value })} />
+              <Input label="Time" type="time" value={draft.time || ''} onChange={(value) => set({ time: value })} />
+              <Input label="Duration (min)" type="number" value={draft.duration} onChange={(value) => set({ duration: value })} />
+            </div>
+          )}
+          <p className="mt-2 text-xs text-[var(--subtle)]">When on, weekly meetings fill into the calendar automatically for the next few weeks — mark attendance as they happen.</p>
+        </div>
         <label className="mt-3 block">
           <span className="text-sm font-medium text-[var(--subtle)]">Notes</span>
           <textarea
