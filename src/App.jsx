@@ -553,7 +553,10 @@ function scheduleSummary(client) {
   const slots = [];
   if (client.day) slots.push(`${client.day}${client.time ? ` ${client.time}` : ''}`);
   if (client.day2) slots.push(`${client.day2}${client.time2 ? ` ${client.time2}` : ''}`);
-  const base = client.scheduleType || 'Manual';
+  const recurring = (client.scheduleType || 'Manual') === 'Recurring';
+  const base = recurring && client.frequency && client.frequency !== 'Weekly'
+    ? `Recurring · ${client.frequency}`
+    : client.scheduleType || 'Manual';
   return slots.length ? `${base} - ${slots.join(', ')}` : base;
 }
 
@@ -813,10 +816,83 @@ function isInPeriod(date, view, today) {
   return target.getFullYear() === start.getFullYear() && target.getMonth() === start.getMonth();
 }
 
-// How far ahead recurring clients' weekly slots are materialized into sessions.
-const RECURRING_HORIZON_DAYS = 28;
+// How far ahead recurring slots are materialized into sessions. ~10 weeks so
+// even monthly and every-4-weeks schedules always show their next occurrence.
+const RECURRING_HORIZON_DAYS = 70;
 const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+// The recurrence cadences a client or group can use. Weekly is the default and
+// what every schedule created before this feature is treated as.
+const SCHEDULE_FREQUENCIES = ['Weekly', 'Every 2 weeks', 'Every 3 weeks', 'Every 4 weeks', 'Monthly'];
+const FREQUENCY_DAYS = { Weekly: 7, 'Every 2 weeks': 14, 'Every 3 weeks': 21, 'Every 4 weeks': 28 };
+// A fixed Monday used to anchor multi-week parity when a schedule has no start
+// or joining date, so which weeks are "on" stays stable across devices and days.
+const EPOCH_ANCHOR = '2020-01-06';
+
+// Which occurrence of its weekday a date is within its month (1 = 1st Tuesday…).
+function ordinalWeekdayOfMonth(iso) {
+  return Math.floor((toDate(iso).getDate() - 1) / 7) + 1;
+}
+
+// ISO for the nth (1-based) occurrence of weekday `dow` in year/monthIdx, or
+// null when that month has no such occurrence (e.g. a 5th Friday).
+function nthWeekdayIso(year, monthIdx, dow, n) {
+  const first = new Date(year, monthIdx, 1);
+  const shift = (dow - first.getDay() + 7) % 7;
+  const day = 1 + shift + (n - 1) * 7;
+  const d = new Date(year, monthIdx, day);
+  return d.getMonth() === monthIdx ? isoOf(d) : null;
+}
+
+// Every occurrence date (inclusive) for one recurring slot within [fromIso,
+// toIso]. `anchorIso` fixes parity for multi-week cadences and the week-of-month
+// for Monthly. Deterministic, so two devices generate the exact same dates.
+function recurringDates(anchorIso, dayName, frequency, fromIso, toIso) {
+  const targetDow = WEEKDAYS.indexOf(dayName);
+  if (targetDow < 0 || fromIso > toIso) return [];
+  // First on-weekday occurrence at or after the anchor — the parity reference.
+  const first = toDate(anchorIso);
+  while (first.getDay() !== targetDow) first.setDate(first.getDate() + 1);
+  const out = [];
+
+  if (frequency === 'Monthly') {
+    const n = ordinalWeekdayOfMonth(isoOf(first));
+    const from = toDate(fromIso);
+    let year = from.getFullYear();
+    let monthIdx = from.getMonth();
+    for (let guard = 0; guard < 240; guard += 1) {
+      if (new Date(year, monthIdx, 1) > toDate(toIso)) break;
+      const iso = nthWeekdayIso(year, monthIdx, targetDow, n);
+      if (iso && iso >= fromIso && iso <= toIso) out.push(iso);
+      monthIdx += 1;
+      if (monthIdx > 11) { monthIdx = 0; year += 1; }
+    }
+    return out;
+  }
+
+  const stepDays = FREQUENCY_DAYS[frequency] || 7;
+  const cursor = first;
+  // Fast-forward to the first occurrence at or after fromIso, keeping parity.
+  if (isoOf(cursor) < fromIso) {
+    const dayGap = Math.round((toDate(fromIso) - cursor) / 86400000);
+    const jumps = Math.floor(dayGap / stepDays);
+    if (jumps > 0) cursor.setDate(cursor.getDate() + jumps * stepDays);
+    while (isoOf(cursor) < fromIso) cursor.setDate(cursor.getDate() + stepDays);
+  }
+  for (let guard = 0; guard < 400; guard += 1) {
+    const iso = isoOf(cursor);
+    if (iso > toIso) break;
+    out.push(iso);
+    cursor.setDate(cursor.getDate() + stepDays);
+  }
+  return out;
+}
+
+// A short cadence label for schedule summaries; Weekly stays implicit elsewhere.
+function frequencyLabel(frequency) {
+  return frequency && frequency !== 'Weekly' ? frequency : 'Weekly';
+}
 
 function isoOf(date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
@@ -836,7 +912,8 @@ function startOfWeekIso(iso) {
   return isoOf(d);
 }
 
-// A recurring client's weekly slots: the primary day/time and an optional second.
+// A recurring client's slots: the primary day/time and an optional second. The
+// client's frequency then decides how often each slot repeats.
 function clientSlots(client) {
   const slots = [];
   if (client.day && client.time) slots.push({ day: client.day, time: client.time });
@@ -855,36 +932,24 @@ function clientSlots(client) {
 // time) so two devices generating the same slot never create a duplicate.
 function reconcileRecurringSessions(clients, sessions, today) {
   const horizonEnd = isoAddDays(today, RECURRING_HORIZON_DAYS);
-  const clientById = Object.fromEntries(clients.map((client) => [client.id, client]));
 
-  const kept = sessions.filter((session) => {
-    const stale = session.auto && session.status === 'Scheduled' && session.date >= today;
-    if (!stale) return true;
-    const client = clientById[session.clientId];
-    if (!client || client.status !== 'Active' || client.scheduleType !== 'Recurring') return false;
-    return clientSlots(client).some(
-      (slot) => slot.time === session.time && WEEKDAYS[toDate(session.date).getDay()] === slot.day,
-    );
-  });
-
-  const existing = new Set(kept.map((session) => `${session.clientId}|${session.date}|${session.time}`));
-  const additions = [];
+  // Every (client, date, time) the current schedules should produce from today
+  // through the horizon — the single source of truth for both filling in missing
+  // sessions and pruning ones that no longer fit (client archived, made manual,
+  // slot moved, or cadence changed). Honors each client's frequency and anchors
+  // multi-week parity to their joining date.
+  const generated = new Map();
   for (const client of clients) {
     if (client.status !== 'Active' || client.scheduleType !== 'Recurring') continue;
-    const startIso =
-      ISO_DATE.test(client.joiningDate || '') && client.joiningDate > today ? client.joiningDate : today;
+    const hasJoin = ISO_DATE.test(client.joiningDate || '');
+    const anchorIso = hasJoin ? client.joiningDate : EPOCH_ANCHOR;
+    const fromIso = hasJoin && client.joiningDate > today ? client.joiningDate : today;
+    const frequency = client.frequency || 'Weekly';
     for (const slot of clientSlots(client)) {
-      const targetDow = WEEKDAYS.indexOf(slot.day);
-      if (targetDow < 0) continue;
-      const cursor = toDate(startIso);
-      while (cursor.getDay() !== targetDow) cursor.setDate(cursor.getDate() + 1);
-      for (; ; cursor.setDate(cursor.getDate() + 7)) {
-        const iso = isoOf(cursor);
-        if (iso > horizonEnd) break;
+      for (const iso of recurringDates(anchorIso, slot.day, frequency, fromIso, horizonEnd)) {
         const key = `${client.id}|${iso}|${slot.time}`;
-        if (existing.has(key)) continue;
-        existing.add(key);
-        additions.push({
+        if (generated.has(key)) continue;
+        generated.set(key, {
           id: `auto-${client.id}-${iso}-${slot.time}`,
           clientId: client.id,
           date: iso,
@@ -896,6 +961,18 @@ function reconcileRecurringSessions(clients, sessions, today) {
         });
       }
     }
+  }
+
+  const kept = sessions.filter((session) => {
+    const stale = session.auto && session.status === 'Scheduled' && session.date >= today;
+    if (!stale) return true;
+    return generated.has(`${session.clientId}|${session.date}|${session.time}`);
+  });
+
+  const existing = new Set(kept.map((session) => `${session.clientId}|${session.date}|${session.time}`));
+  const additions = [];
+  for (const [key, info] of generated) {
+    if (!existing.has(key)) additions.push(info);
   }
 
   if (additions.length === 0 && kept.length === sessions.length) return sessions;
@@ -910,40 +987,23 @@ function reconcileRecurringSessions(clients, sessions, today) {
 // may exist) the meeting is left alone. Same-ref when nothing changes.
 function reconcileGroupSessions(groups, groupSessions, today) {
   const horizonEnd = isoAddDays(today, RECURRING_HORIZON_DAYS);
-  const groupById = Object.fromEntries(groups.map((group) => [group.id, group]));
-  // A group's optional run window: no auto meeting before startDate or after endDate.
-  const withinWindow = (group, iso) =>
-    (!group.startDate || iso >= group.startDate) && (!group.endDate || iso <= group.endDate);
-  const matchesSlot = (group, session) =>
-    group && group.status === 'Active' && group.recurring && group.day && group.time
-    && group.time === session.time && WEEKDAYS[toDate(session.date).getDay()] === group.day
-    && withinWindow(group, session.date);
 
-  const kept = groupSessions.filter((session) => {
-    const unmarked = Object.keys(session.attendance || {}).length === 0;
-    const prunable = session.auto && unmarked && session.date >= today;
-    if (!prunable) return true;
-    return matchesSlot(groupById[session.groupId], session);
-  });
-
-  const existing = new Set(kept.map((session) => `${session.groupId}|${session.date}|${session.time}`));
-  const additions = [];
+  // Every (group, date, time) the recurring groups should produce within their
+  // run window and the horizon — the single source of truth for both adding
+  // missing meetings and pruning ones that no longer fit. Honors each group's
+  // frequency and anchors multi-week parity to its start date.
+  const generated = new Map();
   for (const group of groups) {
     if (group.status !== 'Active' || !group.recurring || !group.day || !group.time) continue;
-    const targetDow = WEEKDAYS.indexOf(group.day);
-    if (targetDow < 0) continue;
-    // Start no earlier than today or the group's start date, and stop at its end.
-    const startBound = group.startDate && group.startDate > today ? group.startDate : today;
-    const cursor = toDate(startBound);
-    while (cursor.getDay() !== targetDow) cursor.setDate(cursor.getDate() + 1);
-    for (; ; cursor.setDate(cursor.getDate() + 7)) {
-      const iso = isoOf(cursor);
-      if (iso > horizonEnd) break;
-      if (group.endDate && iso > group.endDate) break;
+    const hasStart = ISO_DATE.test(group.startDate || '');
+    const anchorIso = hasStart ? group.startDate : EPOCH_ANCHOR;
+    const startBound = hasStart && group.startDate > today ? group.startDate : today;
+    const endBound = group.endDate && group.endDate < horizonEnd ? group.endDate : horizonEnd;
+    const frequency = group.frequency || 'Weekly';
+    for (const iso of recurringDates(anchorIso, group.day, frequency, startBound, endBound)) {
       const key = `${group.id}|${iso}|${group.time}`;
-      if (existing.has(key)) continue;
-      existing.add(key);
-      additions.push({
+      if (generated.has(key)) continue;
+      generated.set(key, {
         id: `gauto-${group.id}-${iso}-${group.time}`,
         groupId: group.id,
         date: iso,
@@ -953,6 +1013,19 @@ function reconcileGroupSessions(groups, groupSessions, today) {
         auto: true,
       });
     }
+  }
+
+  const kept = groupSessions.filter((session) => {
+    const unmarked = Object.keys(session.attendance || {}).length === 0;
+    const prunable = session.auto && unmarked && session.date >= today;
+    if (!prunable) return true;
+    return generated.has(`${session.groupId}|${session.date}|${session.time}`);
+  });
+
+  const existing = new Set(kept.map((session) => `${session.groupId}|${session.date}|${session.time}`));
+  const additions = [];
+  for (const [key, info] of generated) {
+    if (!existing.has(key)) additions.push(info);
   }
 
   if (additions.length === 0 && kept.length === groupSessions.length) return groupSessions;
@@ -1174,8 +1247,8 @@ function App() {
   const clientById = useMemo(() => Object.fromEntries(clients.map((client) => [client.id, client])), [clients]);
   const groupById = useMemo(() => Object.fromEntries(groups.map((group) => [group.id, group])), [groups]);
 
-  // Keep upcoming sessions materialized from each recurring client's weekly
-  // schedule. Runs on mount and whenever clients change (add, edit a day/time,
+  // Keep upcoming sessions materialized from each recurring client's schedule
+  // (at their chosen cadence). Runs on mount and whenever clients change (add, edit a day/time,
   // archive); reads the latest sessions via the functional update so it never
   // needs `sessions` in its deps and can't loop. reconcile is idempotent.
   useEffect(() => {
@@ -3174,6 +3247,9 @@ function ClientEditModal({ client, onSave, onClose }) {
           <Input label="Monthly Fee" type="number" value={draft.monthlyFee} onChange={(value) => set({ monthlyFee: value })} />
           <Select label="Collection Method" value={draft.collectionMethod} options={CLIENT_CSV_ENUMS.collectionMethod} onChange={(value) => set({ collectionMethod: value })} />
           <Select label="Schedule Type" value={draft.scheduleType} options={['Recurring', 'Manual']} onChange={(value) => set({ scheduleType: value })} />
+          {draft.scheduleType === 'Recurring' && (
+            <Select label="Repeats" value={draft.frequency || 'Weekly'} options={SCHEDULE_FREQUENCIES} onChange={(value) => set({ frequency: value })} />
+          )}
           <Select label="Session Day" value={draft.day || ''} options={dayOptions} labels={dayLabels} onChange={(value) => set({ day: value })} />
           <Input label="Session Time" type="time" value={draft.time || ''} onChange={(value) => set({ time: value })} />
           <Select label="Session Day 2" value={draft.day2 || ''} options={dayOptions} labels={dayLabels} onChange={(value) => set({ day2: value })} />
@@ -3250,7 +3326,7 @@ function ChargeEditModal({ charge, onSave, onClose }) {
 }
 
 function emptyGroup() {
-  return { name: '', type: 'Therapy', capacity: 8, billingModel: 'Per Session', sessionFee: 1200, schedule: '', status: 'Active', notes: '', members: [], recurring: false, day: '', time: '', duration: 90, startDate: '', endDate: '' };
+  return { name: '', type: 'Therapy', capacity: 8, billingModel: 'Per Session', sessionFee: 1200, schedule: '', status: 'Active', notes: '', members: [], recurring: false, frequency: 'Weekly', day: '', time: '', duration: 90, startDate: '', endDate: '' };
 }
 
 function GroupSessionCard({ session, group, clients, onMark, onRemove }) {
@@ -3387,7 +3463,7 @@ function Groups({ groups, clients, clientList, groupSessions, settings, today, a
               </div>
               {(() => {
                 const scheduleText = selected.recurring && selected.day && selected.time
-                  ? `Weekly · ${selected.day} ${selected.time} · ${selected.duration || 90} min`
+                  ? `${frequencyLabel(selected.frequency)} · ${selected.day} ${selected.time} · ${selected.duration || 90} min`
                   : selected.schedule;
                 const fmt = (iso) => formatDate(iso, { day: '2-digit', month: 'short', year: 'numeric' });
                 const windowText = selected.startDate || selected.endDate
@@ -3515,20 +3591,21 @@ function GroupEditModal({ group, clientList, isNew, onSave, onClose }) {
           <Input label="Start date" type="date" value={draft.startDate || ''} onChange={(value) => set({ startDate: value })} />
           <Input label="End date (optional)" type="date" value={draft.endDate || ''} onChange={(value) => set({ endDate: value })} />
         </div>
-        <p className="mt-1 text-xs text-[var(--subtle)]">Weekly meetings and billing only begin on the start date. Leave the end date blank to keep the group running.</p>
+        <p className="mt-1 text-xs text-[var(--subtle)]">Meetings and billing only begin on the start date. Leave the end date blank to keep the group running.</p>
         <div className="mt-3 rounded-md border border-[var(--line)] bg-[var(--bg)] p-3">
           <label className="flex items-center gap-2 text-sm font-medium">
             <input type="checkbox" className="h-4 w-4 accent-[var(--primary)]" checked={!!draft.recurring} onChange={(event) => set({ recurring: event.target.checked })} />
-            Recurring weekly
+            Recurring
           </label>
           {draft.recurring && (
-            <div className="mt-3 grid gap-3 sm:grid-cols-3">
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <Select label="Repeats" value={draft.frequency || 'Weekly'} options={SCHEDULE_FREQUENCIES} onChange={(value) => set({ frequency: value })} />
               <Select label="Day" value={draft.day || ''} options={['', ...WEEKDAYS]} labels={{ '': '—' }} onChange={(value) => set({ day: value })} />
               <Input label="Time" type="time" value={draft.time || ''} onChange={(value) => set({ time: value })} />
               <Input label="Duration (min)" type="number" value={draft.duration} onChange={(value) => set({ duration: value })} />
             </div>
           )}
-          <p className="mt-2 text-xs text-[var(--subtle)]">When on, weekly meetings fill into the calendar automatically for the next few weeks — mark attendance as they happen.</p>
+          <p className="mt-2 text-xs text-[var(--subtle)]">When on, meetings fill into the calendar automatically for the weeks ahead — mark attendance as they happen. Fortnightly and monthly cadences count from the start date.</p>
         </div>
         <label className="mt-3 block">
           <span className="text-sm font-medium text-[var(--subtle)]">Notes</span>
@@ -4318,6 +4395,7 @@ function emptyClient() {
     monthlyFee: 0,
     collectionMethod: 'Pay After Session',
     scheduleType: 'Manual',
+    frequency: 'Weekly',
     day: '',
     time: '',
     day2: '',
