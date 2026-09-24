@@ -1577,6 +1577,25 @@ function App() {
     });
   }
 
+  // When recurring clients are added to a recurring group, their own 1:1 sessions
+  // and the group meeting both land on the schedule. Offer to switch those
+  // members to one-off so they only appear through the group; declining keeps
+  // both (a client can genuinely have group + individual sessions). Only asks
+  // about members who actually have a recurring 1:1 schedule.
+  function offerGroupMembersOneOff(memberIds) {
+    const recurringMembers = (memberIds || [])
+      .map((id) => clientById[id])
+      .filter((client) => client && client.status === 'Active' && client.scheduleType === 'Recurring');
+    if (recurringMembers.length === 0) return;
+    const names = recurringMembers.map((client) => client.name).join(', ');
+    const message = recurringMembers.length === 1
+      ? `${names} has their own recurring 1:1 sessions. Set them to one-off so they only appear through this group? Upcoming 1:1 slots are removed; past sessions stay.`
+      : `${recurringMembers.length} members (${names}) have their own recurring 1:1 sessions. Set them to one-off so they only appear through this group? Upcoming 1:1 slots are removed; past sessions stay.`;
+    if (!window.confirm(message)) return;
+    const ids = new Set(recurringMembers.map((client) => client.id));
+    setClients((current) => current.map((client) => (ids.has(client.id) ? { ...client, scheduleType: 'Manual' } : client)));
+  }
+
   function addGroup(draft) {
     if (!String(draft.name || '').trim()) return false;
     const group = {
@@ -1589,12 +1608,17 @@ function App() {
     };
     setGroups((current) => [...current, group]);
     showNotice(`${group.name} created.`);
+    if (group.recurring && group.day && group.time) offerGroupMembersOneOff(group.members);
     return group.id;
   }
 
   function updateGroup(next) {
+    const prior = groups.find((group) => group.id === next.id);
+    const priorMembers = new Set(prior?.members || []);
+    const newlyAdded = (next.members || []).filter((id) => !priorMembers.has(id));
     setGroups((current) => current.map((group) => (group.id === next.id ? next : group)));
     showNotice(`${next.name} updated.`);
+    if (next.recurring && next.day && next.time) offerGroupMembersOneOff(newlyAdded);
   }
 
   // Delete a group. Future/unmarked sessions go with it; any session that already
