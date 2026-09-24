@@ -1135,7 +1135,7 @@ function App() {
   const [payments, setPayments] = usePersistentState('payments', []);
   const [selectedClientId, setSelectedClientId] = useState('c1');
   const [clientTab, setClientTab] = useState('Overview');
-  const [paymentDraft, setPaymentDraft] = useState({ clientId: 'c1', amount: 2500, method: 'UPI', reference: '', notes: '', chargeId: '' });
+  const [paymentDraft, setPaymentDraft] = useState({ clientId: 'c1', amount: '', method: 'UPI', reference: '', notes: '', chargeId: '' });
   const [clientDraft, setClientDraft] = useState(emptyClient());
   const [toast, setToast] = useState(null); // { id, message, action }
   const toastTimer = useRef(null);
@@ -1436,12 +1436,18 @@ function App() {
     const amount = Number(paymentDraft.amount);
     const client = clientById[paymentDraft.clientId];
     if (!client || amount <= 0) return;
+    // The month this payment is for: the targeted charge's month when one is
+    // chosen, otherwise the month it's being recorded in. Stored so the ledger
+    // can always say which month a payment settled.
+    const targetCharge = paymentDraft.chargeId ? charges.find((charge) => charge.id === paymentDraft.chargeId) : null;
+    const period = monthKey(targetCharge ? targetCharge.date : today);
     setPayments((current) => [
       ...current,
       {
         id: `p${Date.now()}`,
         clientId: paymentDraft.clientId,
         date: today,
+        period,
         amount,
         method: paymentDraft.method,
         reference: paymentDraft.reference || 'Manual',
@@ -1451,7 +1457,7 @@ function App() {
       },
     ]);
     showNotice(`Payment recorded for ${client.name}.`);
-    setPaymentDraft({ ...paymentDraft, amount: 2500, reference: '', notes: '', chargeId: '' });
+    setPaymentDraft({ ...paymentDraft, amount: '', reference: '', notes: '', chargeId: '' });
   }
 
   function addClient(event) {
@@ -3580,6 +3586,42 @@ function Payments({ clients, ledgers, payments, charges, allocation, paymentDraf
     ),
   };
 
+  // Pre-fill the amount with what's actually owed — the chosen charge's balance,
+  // or the client's outstanding when settling oldest-first — so the therapist
+  // isn't retyping the fee each time. Re-runs when the client, the target
+  // charge, or the owed balance changes (e.g. right after a payment posts), but
+  // not on a plain keystroke, so a hand-edited amount stays put until then.
+  const targetBalance = paymentDraft.chargeId
+    ? allocation?.byCharge[paymentDraft.chargeId]?.balance
+    : ledgers[paymentDraft.clientId]?.outstanding;
+  useEffect(() => {
+    setPaymentDraft((draft) => ({ ...draft, amount: targetBalance > 0 ? targetBalance : '' }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paymentDraft.clientId, paymentDraft.chargeId, targetBalance]);
+
+  // Each payment's "balance after" — the client's outstanding as of that payment,
+  // counting only charges dated on or before it and the payments up to and
+  // including it. A meaningful per-row figure, unlike the client's live total
+  // (which looks identical on every row and inflates with future auto-charges).
+  const balanceAfter = useMemo(() => {
+    const paymentsByClient = {};
+    for (const payment of payments) (paymentsByClient[payment.clientId] ||= []).push(payment);
+    const byId = {};
+    const order = (a, b) => (a.date === b.date ? String(a.id).localeCompare(String(b.id)) : a.date.localeCompare(b.date));
+    for (const [clientId, clientPayments] of Object.entries(paymentsByClient)) {
+      const clientCharges = charges.filter((charge) => charge.clientId === clientId);
+      let paidSoFar = 0;
+      for (const payment of clientPayments.slice().sort(order)) {
+        paidSoFar += Number(payment.amount) || 0;
+        const chargedToDate = clientCharges
+          .filter((charge) => charge.date <= payment.date)
+          .reduce((sum, charge) => sum + (Number(charge.amount) || 0), 0);
+        byId[payment.id] = Math.max(chargedToDate - paidSoFar, 0);
+      }
+    }
+    return byId;
+  }, [payments, charges]);
+
   return (
     <div className="grid gap-5 xl:grid-cols-[0.8fr_1.2fr]">
       <Panel>
@@ -3623,11 +3665,15 @@ function Payments({ clients, ledgers, payments, charges, allocation, paymentDraf
                 <div>
                   <p className="font-semibold">{client.name}</p>
                   <p className="text-sm text-[var(--subtle)]">{formatDate(payment.date)} - {payment.method} - {payment.reference}</p>
-                  <p className="text-xs text-[var(--subtle)]">{target ? `Applied to ${target.reason}` : 'Oldest unpaid first'}</p>
+                  <p className="text-xs text-[var(--subtle)]">
+                    {target
+                      ? `For ${monthLabel(monthKey(target.date))} · ${target.reason}`
+                      : `For ${monthLabel(payment.period || monthKey(payment.date))} · oldest balance`}
+                  </p>
                 </div>
                 <div className="text-left sm:text-right">
                   <p className="font-semibold">{formatMoney(payment.amount)}</p>
-                  <p className="text-sm text-[var(--subtle)]">Outstanding {formatMoney(ledgers[payment.clientId]?.outstanding || 0)}</p>
+                  <p className="text-sm text-[var(--subtle)]">Balance after {formatMoney(balanceAfter[payment.id] || 0)}</p>
                 </div>
               </div>
             );
