@@ -1904,6 +1904,7 @@ function App() {
                 addGroup={addGroup}
                 updateGroup={updateGroup}
                 removeGroup={removeGroup}
+                makeMembersOneOff={offerGroupMembersOneOff}
                 addGroupSession={addGroupSession}
                 removeGroupSession={removeGroupSession}
                 markGroupAttendance={markGroupAttendance}
@@ -3399,7 +3400,7 @@ function GroupSessionCard({ session, group, clients, onMark, onRemove }) {
   );
 }
 
-function Groups({ groups, clients, clientList, groupSessions, settings, today, addGroup, updateGroup, removeGroup, addGroupSession, removeGroupSession, markGroupAttendance }) {
+function Groups({ groups, clients, clientList, groupSessions, settings, today, addGroup, updateGroup, removeGroup, makeMembersOneOff, addGroupSession, removeGroupSession, markGroupAttendance }) {
   const [selectedId, setSelectedId] = useState(groups[0]?.id || null);
   const [editing, setEditing] = useState(null); // a group object, or 'new'
   const [draft, setDraft] = useState({ date: today, time: '18:00', duration: 90 });
@@ -3507,6 +3508,34 @@ function Groups({ groups, clients, clientList, groupSessions, settings, today, a
                   <span key={id} className="rounded-md bg-[var(--panel-muted)] px-3 py-1.5 text-sm">{clients[id]?.name || 'Unknown'}</span>
                 ))}
               </div>
+
+              {(() => {
+                // Members who also have their own recurring 1:1 schedule show up
+                // on the calendar twice — once here, once as individual sessions.
+                // Offer a one-click switch to one-off so they only appear via the
+                // group. Only meaningful once this group actually meets.
+                const recurringMembers = selected.members
+                  .map((id) => clients[id])
+                  .filter((client) => client && client.status === 'Active' && client.scheduleType === 'Recurring');
+                if (recurringMembers.length === 0 || !(selected.recurring && selected.day && selected.time)) return null;
+                const names = recurringMembers.map((client) => client.name).join(', ');
+                return (
+                  <div className="mt-3 rounded-md border border-[var(--line)] bg-[var(--accent-soft)] p-3">
+                    <p className="text-sm font-medium">Also on the schedule as 1:1s</p>
+                    <p className="mt-1 text-xs text-[var(--subtle)]">
+                      {names} {recurringMembers.length === 1 ? 'has' : 'have'} their own recurring individual sessions, which appear alongside this group. Switch to one-off so they only show through the group — upcoming 1:1 slots are removed, past sessions stay.
+                    </p>
+                    <button
+                      type="button"
+                      className="icon-button mt-2 px-3 py-2 text-xs"
+                      onClick={() => makeMembersOneOff(recurringMembers.map((client) => client.id))}
+                    >
+                      <CalendarDays size={14} />
+                      Make one-off
+                    </button>
+                  </div>
+                );
+              })()}
 
               <h4 className="mt-6 font-semibold">Sessions</h4>
               <p className="mt-1 text-sm text-[var(--subtle)]">Marking a member present bills their own session rate, or the group fee if they have none. Auto charge is {settings.autoCreateCharges ? 'on' : 'off'}.</p>
