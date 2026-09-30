@@ -4799,4 +4799,38 @@ function downloadFile(filename, content, type) {
   URL.revokeObjectURL(href);
 }
 
+// Pure domain logic exported for unit tests (see src/domain.test.js). These are
+// dependency-free of React/DOM; a future refactor can relocate them to their own
+// module without changing the tests beyond the import path.
+export {
+  toDate,
+  isoOf,
+  isoAddDays,
+  monthKey,
+  addMonths,
+  monthsThrough,
+  endOfMonthIso,
+  ordinalWeekdayOfMonth,
+  nthWeekdayIso,
+  recurringDates,
+  frequencyLabel,
+  clientSlots,
+  reconcileRecurringSessions,
+  reconcileGroupSessions,
+  reconcileSubscriptionCharges,
+  allocateLedger,
+  computeMonthlyStatement,
+  timeToMinutes,
+  occupiesSlot,
+  sessionsClash,
+  findConflicts,
+  firstClash,
+  renderTemplate,
+  SUBSCRIPTION_BACKFILL_MONTHS,
+  ACCOUNTING_RESET_DATE,
+  ACCOUNTING_RESET_MONTH,
+  EPOCH_ANCHOR,
+  SCHEDULE_FREQUENCIES,
+};
+
 export default App;
