@@ -129,11 +129,22 @@ async function createFolder(token) {
 async function listFolderFiles(token, folderId) {
   const q = encodeURIComponent(`'${folderId}' in parents and trashed=false`);
   const response = await driveFetch(
-    `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&spaces=drive`,
+    `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,version)&spaces=drive`,
     token,
   );
   const json = await response.json();
   return json.files || [];
+}
+
+// Drive's monotonically-increasing revision counter for a file. Used to detect a
+// competing write from another device before we overwrite.
+async function getFileVersion(token, fileId) {
+  const response = await driveFetch(
+    `https://www.googleapis.com/drive/v3/files/${fileId}?fields=version`,
+    token,
+  );
+  const json = await response.json();
+  return Number(json.version) || null;
 }
 
 async function readFile(token, fileId) {
@@ -152,7 +163,7 @@ async function createFile(token, folderId, name, content) {
     `--${boundary}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(content)}\r\n` +
     `--${boundary}--`;
   const response = await driveFetch(
-    'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id',
+    'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,version',
     token,
     {
       method: 'POST',
@@ -160,16 +171,46 @@ async function createFile(token, folderId, name, content) {
       body,
     },
   );
-  const json = await response.json();
-  return json.id;
+  // Returns { id, version }; callers that only need the id read .id.
+  return response.json();
 }
 
 async function updateFile(token, fileId, content) {
-  await driveFetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, token, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(content),
-  });
+  const response = await driveFetch(
+    `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media&fields=version`,
+    token,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(content),
+    },
+  );
+  const json = await response.json();
+  return Number(json.version) || null;
+}
+
+// Merge two versions of one file when both changed since the last sync. Arrays
+// are unioned by record id, so every record added on either side survives;
+// `overlay` wins when the same id exists on both. settings is a shallow object
+// merge with `overlay` winning per key. Called both directions: on connect with
+// overlay = remote (the shared truth, keeping local-only offline additions), and
+// on a push conflict with overlay = local (this device's active edits win, while
+// records another device added are kept).
+export function mergeValue(key, base, overlay) {
+  if (EXPECTED_SHAPE[key] === 'array') {
+    if (!Array.isArray(base)) return Array.isArray(overlay) ? overlay : [];
+    if (!Array.isArray(overlay)) return base;
+    const byId = new Map();
+    const idless = [];
+    for (const item of [...base, ...overlay]) {
+      if (item && item.id != null) byId.set(item.id, item);
+      else idless.push(item);
+    }
+    return [...byId.values(), ...idless];
+  }
+  const b = base && typeof base === 'object' && !Array.isArray(base) ? base : {};
+  const o = overlay && typeof overlay === 'object' && !Array.isArray(overlay) ? overlay : {};
+  return { ...b, ...o };
 }
 
 async function findChildFolder(token, parentId, name) {
@@ -252,7 +293,7 @@ async function pruneBackups(token, files) {
   }
 }
 
-export function useGoogleDrive({ clientId, data, applyRemote }) {
+export function useGoogleDrive({ clientId, data, applyRemote, onConflict }) {
   const [status, setStatus] = useState('disconnected'); // disconnected | connecting | syncing | connected | error
   const [email, setEmail] = useState('');
   const [name, setName] = useState('');
@@ -266,6 +307,7 @@ export function useGoogleDrive({ clientId, data, applyRemote }) {
   const folderRef = useRef(null);
   const backupFolderRef = useRef(null);
   const fileIdsRef = useRef({});
+  const versionRef = useRef({}); // key -> last Drive `version` we've seen
   const snapshotRef = useRef({});
   const readyRef = useRef(false);
   const dataRef = useRef(data);
@@ -315,15 +357,18 @@ export function useGoogleDrive({ clientId, data, applyRemote }) {
       folderRef.current = folderId;
 
       const existing = freshFolder ? [] : await listFolderFiles(token, folderId);
-      const idByName = Object.fromEntries(existing.map((file) => [file.name, file.id]));
+      const metaByName = Object.fromEntries(existing.map((file) => [file.name, file]));
 
       const remote = {};
       const fileIds = {};
+      const versions = {};
       for (const [key, name] of FILE_KEYS) {
-        if (idByName[name]) {
-          fileIds[key] = idByName[name];
+        const meta = metaByName[name];
+        if (meta) {
+          fileIds[key] = meta.id;
+          versions[key] = Number(meta.version) || null;
           try {
-            const content = await readFile(token, idByName[name]);
+            const content = await readFile(token, meta.id);
             // Only trust a remote file whose shape matches; a legacy or corrupt
             // file is left out of `remote` so local data seeds and heals it below.
             if (hasExpectedShape(key, content)) remote[key] = content;
@@ -333,24 +378,31 @@ export function useGoogleDrive({ clientId, data, applyRemote }) {
         }
       }
 
-      // Valid remote wins where it exists; local seeds anything missing or invalid.
+      // Merge remote (the shared truth) over local so this device picks up other
+      // devices' changes without discarding edits it made while offline. Records
+      // are unioned by id; on a same-id clash the remote wins here.
       const effective = {};
       for (const [key] of FILE_KEYS) {
-        effective[key] = key in remote ? remote[key] : dataRef.current[key];
+        effective[key] = key in remote ? mergeValue(key, dataRef.current[key], remote[key]) : dataRef.current[key];
       }
 
-      if (Object.keys(remote).length > 0) applyRemote(remote);
+      applyRemote(effective);
 
       for (const [key, name] of FILE_KEYS) {
         if (!fileIds[key]) {
-          fileIds[key] = await createFile(token, folderId, name, effective[key]);
-        } else if (!(key in remote)) {
-          // File exists on Drive but was missing/invalid — overwrite it with good data.
-          await updateFile(token, fileIds[key], effective[key]);
+          const json = await createFile(token, folderId, name, effective[key]);
+          fileIds[key] = json.id;
+          versions[key] = Number(json.version) || null;
+        } else if (JSON.stringify(effective[key]) !== JSON.stringify(remote[key])) {
+          // Drive is behind the merged result (file was missing/invalid, or we
+          // merged in local-only edits) — write the merged data back up.
+          const v = await updateFile(token, fileIds[key], effective[key]);
+          versions[key] = v ?? versions[key];
         }
       }
 
       fileIdsRef.current = fileIds;
+      versionRef.current = versions;
       snapshotRef.current = Object.fromEntries(
         FILE_KEYS.map(([key]) => [key, JSON.stringify(effective[key])]),
       );
@@ -413,6 +465,7 @@ export function useGoogleDrive({ clientId, data, applyRemote }) {
     folderRef.current = null;
     backupFolderRef.current = null;
     fileIdsRef.current = {};
+    versionRef.current = {};
     snapshotRef.current = {};
     readyRef.current = false;
     setEmail('');
@@ -485,7 +538,10 @@ export function useGoogleDrive({ clientId, data, applyRemote }) {
     }
   }, [applyRemote, withFreshToken]);
 
-  // Push changed files to Drive, debounced, once the initial sync is done.
+  // Push changed files to Drive, debounced, once the initial sync is done. Each
+  // write is guarded by the file's Drive `version`: if another device wrote the
+  // file since we last synced, we merge our change into theirs instead of
+  // overwriting (last-write-wins would silently drop the other device's data).
   useEffect(() => {
     if (status !== 'connected' || !readyRef.current) return undefined;
     const handle = window.setTimeout(async () => {
@@ -493,16 +549,45 @@ export function useGoogleDrive({ clientId, data, applyRemote }) {
       const changed = FILE_KEYS.filter(([key]) => JSON.stringify(current[key]) !== snapshotRef.current[key]);
       if (changed.length === 0) return;
       try {
+        const merges = {};
         await withFreshToken(async (token) => {
           for (const [key, name] of changed) {
-            if (fileIdsRef.current[key]) {
-              await updateFile(token, fileIdsRef.current[key], current[key]);
-            } else {
-              fileIdsRef.current[key] = await createFile(token, folderRef.current, name, current[key]);
+            const fileId = fileIdsRef.current[key];
+            if (!fileId) {
+              const json = await createFile(token, folderRef.current, name, current[key]);
+              fileIdsRef.current[key] = json.id;
+              versionRef.current[key] = Number(json.version) || null;
+              snapshotRef.current[key] = JSON.stringify(current[key]);
+              continue;
             }
-            snapshotRef.current[key] = JSON.stringify(current[key]);
+            const remoteVersion = await getFileVersion(token, fileId);
+            const knownVersion = versionRef.current[key];
+            if (knownVersion == null || remoteVersion == null || remoteVersion === knownVersion) {
+              // No competing write since our last sync — safe to overwrite.
+              const v = await updateFile(token, fileId, current[key]);
+              versionRef.current[key] = v ?? remoteVersion;
+              snapshotRef.current[key] = JSON.stringify(current[key]);
+            } else {
+              // Another device wrote this file — merge our change into theirs.
+              let remoteContent = null;
+              try {
+                const c = await readFile(token, fileId);
+                if (hasExpectedShape(key, c)) remoteContent = c;
+              } catch {
+                // Unreadable remote — fall back to writing our own data.
+              }
+              const mergedVal = remoteContent == null ? current[key] : mergeValue(key, remoteContent, current[key]);
+              const v = await updateFile(token, fileId, mergedVal);
+              versionRef.current[key] = v ?? remoteVersion;
+              snapshotRef.current[key] = JSON.stringify(mergedVal);
+              merges[key] = mergedVal;
+            }
           }
         });
+        if (Object.keys(merges).length > 0) {
+          applyRemote(merges); // pull the merged records into local state
+          onConflict?.();
+        }
         setLastSyncedAt(Date.now());
       } catch (err) {
         setError(err.message || 'Sync to Drive failed. Reconnect to retry.');
@@ -510,7 +595,7 @@ export function useGoogleDrive({ clientId, data, applyRemote }) {
       }
     }, 1200);
     return () => window.clearTimeout(handle);
-  }, [serialized, status, withFreshToken]);
+  }, [serialized, status, withFreshToken, applyRemote, onConflict]);
 
   return {
     status,

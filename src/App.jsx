@@ -1346,7 +1346,15 @@ function App() {
     if (Array.isArray(remote.payments)) setPayments(remote.payments);
   }, [setSettings, setClients, setGroups, setSessions, setGroupSessions, setCharges, setPayments]);
 
-  const drive = useGoogleDrive({ clientId: GOOGLE_CLIENT_ID, data: driveData, applyRemote });
+  // Stable notifier for the Drive hook (showNotice is redefined each render, so
+  // route through a ref to avoid resetting the sync effect's debounce timer).
+  const noticeRef = useRef(null);
+  noticeRef.current = (message) => showNotice(message);
+  const onDriveConflict = useCallback(() => {
+    noticeRef.current?.('Merged in changes from another device.');
+  }, []);
+
+  const drive = useGoogleDrive({ clientId: GOOGLE_CLIENT_ID, data: driveData, applyRemote, onConflict: onDriveConflict });
 
   // Returning, already-set-up user: refresh the session in the background so the
   // app opens instantly from cache and syncs when silent auth succeeds.
