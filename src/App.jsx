@@ -117,6 +117,7 @@ const initialSettings = {
   lateCancellationCharge: 100,
   monthlyStatements: true,
   outstandingReminders: true,
+  reminderTemplate: '',
   profileComplete: false,
 };
 
@@ -430,17 +431,60 @@ function formatStatementText(statement, settings) {
 }
 
 // A short, gentle nudge for a client who still owes money — separate from the
-// full monthly statement above.
+// full monthly statement above. The wording is therapist-editable via
+// settings.reminderTemplate; the placeholders below are filled at send time.
+const REMINDER_PLACEHOLDERS = [
+  { token: '{clientName}', label: 'Client name' },
+  { token: '{amount}', label: 'Outstanding amount' },
+  { token: '{period}', label: 'Month, e.g. September 2026' },
+  { token: '{practiceName}', label: 'Practice name' },
+  { token: '{therapistName}', label: 'Your name' },
+  { token: '{paymentDetails}', label: 'Payment details' },
+];
+
+const DEFAULT_REMINDER_TEMPLATE = [
+  '{practiceName} — payment reminder',
+  '',
+  'Hi {clientName},',
+  'A gentle reminder that {amount} is outstanding on your account as of {period}.',
+  'You can pay via {paymentDetails}.',
+  'Thank you!',
+  '',
+  '— {therapistName}',
+].join('\n');
+
+// Substitute {tokens} from values. A line whose ONLY placeholders all resolve to
+// empty is dropped, so an unset field (e.g. payment details) doesn't leave a
+// dangling "You can pay via ." line.
+function renderTemplate(template, values) {
+  return template
+    .split('\n')
+    .filter((line) => {
+      const tokens = line.match(/\{(\w+)\}/g) || [];
+      if (tokens.length === 0) return true;
+      return tokens.some((token) => String(values[token.slice(1, -1)] ?? '').trim() !== '');
+    })
+    .map((line) => line.replace(/\{(\w+)\}/g, (match, key) => {
+      const value = values[key];
+      return value == null ? '' : String(value);
+    }))
+    .join('\n');
+}
+
+function reminderValues(statement, settings, label) {
+  return {
+    clientName: statement.clientName,
+    amount: formatMoney(statement.outstanding),
+    period: label || '',
+    practiceName: settings.practiceName,
+    therapistName: settings.therapistName,
+    paymentDetails: settings.paymentDetails,
+  };
+}
+
 function formatReminderText(statement, settings, label) {
-  const lines = [
-    `${settings.practiceName} — payment reminder`,
-    '',
-    `Hi ${statement.clientName},`,
-    `A gentle reminder that ${formatMoney(statement.outstanding)} is outstanding on your account${label ? ` as of ${label}` : ''}.`,
-  ];
-  if (settings.paymentDetails) lines.push(`You can pay via ${settings.paymentDetails}.`);
-  lines.push('Thank you!', '', `— ${settings.therapistName}`);
-  return lines.join('\n');
+  const template = settings.reminderTemplate || DEFAULT_REMINDER_TEMPLATE;
+  return renderTemplate(template, reminderValues(statement, settings, label));
 }
 
 // Deep links that open a prefilled message for the therapist to review and send
@@ -4091,6 +4135,61 @@ function Reports({ stats, exportJson }) {
   );
 }
 
+function ReminderTemplateEditor({ settings, setSettings }) {
+  const value = settings.reminderTemplate || DEFAULT_REMINDER_TEMPLATE;
+  const isCustom = Boolean(settings.reminderTemplate) && settings.reminderTemplate !== DEFAULT_REMINDER_TEMPLATE;
+  const preview = renderTemplate(
+    value,
+    reminderValues(
+      { clientName: 'Meera Shah', outstanding: 2500 },
+      settings,
+      monthLabel(monthKey(isoOf(new Date()))),
+    ),
+  );
+
+  function onChange(event) {
+    const next = event.target.value;
+    setSettings({ ...settings, reminderTemplate: next === DEFAULT_REMINDER_TEMPLATE ? '' : next });
+  }
+
+  return (
+    <div className="rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-sm font-semibold">Reminder message</p>
+        {isCustom && (
+          <button
+            type="button"
+            className="text-xs font-medium text-[var(--primary)] hover:underline"
+            onClick={() => setSettings({ ...settings, reminderTemplate: '' })}
+          >
+            Reset to default
+          </button>
+        )}
+      </div>
+      <p className="mt-1 text-sm text-[var(--subtle)]">The text used for outstanding-balance nudges. Edit it to match your voice.</p>
+      <textarea
+        value={value}
+        onChange={onChange}
+        rows={8}
+        className="mt-3 w-full rounded-md border border-[var(--line)] bg-[var(--panel)] px-3 py-2 font-mono text-sm text-[var(--text)]"
+      />
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {REMINDER_PLACEHOLDERS.map((placeholder) => (
+          <span
+            key={placeholder.token}
+            title={placeholder.label}
+            className="rounded border border-[var(--line)] bg-[var(--panel)] px-1.5 py-0.5 font-mono text-xs text-[var(--subtle)]"
+          >
+            {placeholder.token}
+          </span>
+        ))}
+      </div>
+      <p className="mt-3 text-xs font-medium text-[var(--subtle)]">Preview</p>
+      <pre className="mt-1 whitespace-pre-wrap rounded-md border border-[var(--line)] bg-[var(--panel)] px-3 py-2 text-sm text-[var(--text)]">{preview}</pre>
+    </div>
+  );
+}
+
 function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, drive, onNotice }) {
   return (
     <div className="grid gap-5 xl:grid-cols-2">
@@ -4128,6 +4227,7 @@ function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, dri
           <Select label="Late Cancellation Charge" value={String(settings.lateCancellationCharge)} options={['0', '50', '100']} labels={{ 0: '0%', 50: '50%', 100: '100%' }} onChange={(value) => setSettings({ ...settings, lateCancellationCharge: Number(value) })} />
           <Toggle label="Monthly Statements" checked={settings.monthlyStatements} onChange={(checked) => setSettings({ ...settings, monthlyStatements: checked })} />
           <Toggle label="Outstanding Reminders" checked={settings.outstandingReminders} onChange={(checked) => setSettings({ ...settings, outstandingReminders: checked })} />
+          <ReminderTemplateEditor settings={settings} setSettings={setSettings} />
         </div>
       </Panel>
     </div>
