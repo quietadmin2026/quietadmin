@@ -118,6 +118,13 @@ const initialSettings = {
   monthlyStatements: true,
   outstandingReminders: true,
   reminderTemplate: '',
+  // Subscription clients are never auto-billed for months before this (YYYY-MM).
+  // Empty = no floor. The "Start fresh" reset sets it so pre-reset months can't
+  // regenerate. See reconcileSubscriptionCharges.
+  accountingStartMonth: '',
+  // Deterministic ids of subscription charges the therapist deleted on purpose,
+  // so reconcile doesn't recreate them. See deleteCharge / reconcileSubscriptionCharges.
+  deletedSubscriptionCharges: [],
   profileComplete: false,
 };
 
@@ -974,8 +981,11 @@ function clientSlots(client) {
 // untouched. Returns the same array reference when nothing changes so callers
 // can skip a state update. Session ids are deterministic per (client, date,
 // time) so two devices generating the same slot never create a duplicate.
-function reconcileRecurringSessions(clients, sessions, today) {
+function reconcileRecurringSessions(clients, sessions, today, startFloorIso = '') {
   const horizonEnd = isoAddDays(today, RECURRING_HORIZON_DAYS);
+  // Never generate a session before the accounting-start date (set by the reset),
+  // so a fresh start can't be undone by regenerating pre-reset occurrences.
+  const floor = startFloorIso && startFloorIso > today ? startFloorIso : today;
 
   // Every (client, date, time) the current schedules should produce from today
   // through the horizon — the single source of truth for both filling in missing
@@ -987,7 +997,7 @@ function reconcileRecurringSessions(clients, sessions, today) {
     if (client.status !== 'Active' || client.scheduleType !== 'Recurring') continue;
     const hasJoin = ISO_DATE.test(client.joiningDate || '');
     const anchorIso = hasJoin ? client.joiningDate : EPOCH_ANCHOR;
-    const fromIso = hasJoin && client.joiningDate > today ? client.joiningDate : today;
+    const fromIso = hasJoin && client.joiningDate > floor ? client.joiningDate : floor;
     const frequency = client.frequency || 'Weekly';
     for (const slot of clientSlots(client)) {
       for (const iso of recurringDates(anchorIso, slot.day, frequency, fromIso, horizonEnd)) {
@@ -1029,8 +1039,9 @@ function reconcileRecurringSessions(clients, sessions, today) {
 // still-future, *unmarked* group sessions are pruned when a group stops
 // recurring or moves its slot — once anyone's attendance is marked (and charges
 // may exist) the meeting is left alone. Same-ref when nothing changes.
-function reconcileGroupSessions(groups, groupSessions, today) {
+function reconcileGroupSessions(groups, groupSessions, today, startFloorIso = '') {
   const horizonEnd = isoAddDays(today, RECURRING_HORIZON_DAYS);
+  const floor = startFloorIso && startFloorIso > today ? startFloorIso : today;
 
   // Every (group, date, time) the recurring groups should produce within their
   // run window and the horizon — the single source of truth for both adding
@@ -1041,7 +1052,7 @@ function reconcileGroupSessions(groups, groupSessions, today) {
     if (group.status !== 'Active' || !group.recurring || !group.day || !group.time) continue;
     const hasStart = ISO_DATE.test(group.startDate || '');
     const anchorIso = hasStart ? group.startDate : EPOCH_ANCHOR;
-    const startBound = hasStart && group.startDate > today ? group.startDate : today;
+    const startBound = hasStart && group.startDate > floor ? group.startDate : floor;
     const endBound = group.endDate && group.endDate < horizonEnd ? group.endDate : horizonEnd;
     const frequency = group.frequency || 'Weekly';
     for (const iso of recurringDates(anchorIso, group.day, frequency, startBound, endBound)) {
@@ -1080,6 +1091,11 @@ function reconcileGroupSessions(groups, groupSessions, today) {
 // old joining date can't suddenly generate years of charges.
 const SUBSCRIPTION_BACKFILL_MONTHS = 12;
 
+// The clean-slate boundary for the "Start fresh" reset: everything dated before
+// this is purged, and subscription billing is floored here so it can't come back.
+const ACCOUNTING_RESET_DATE = '2026-10-01';
+const ACCOUNTING_RESET_MONTH = '2026-10';
+
 // Shift a YYYY-MM period by n months.
 function addMonths(period, n) {
   const [year, month] = period.split('-').map(Number);
@@ -1103,10 +1119,14 @@ function monthsThrough(start, end) {
 // and, unlike the session engine, never removes anything — charges are money and
 // may already be paid, so a changed plan or fee just stops future generation and
 // leaves prior charges to be voided by hand. Same array reference when unchanged.
-function reconcileSubscriptionCharges(clients, charges, autoCreate, today) {
+function reconcileSubscriptionCharges(clients, charges, autoCreate, today, accountingStartMonth = '', deletedIds = []) {
   if (!autoCreate) return charges;
   const currentMonth = monthKey(today);
-  const floorMonth = addMonths(currentMonth, -SUBSCRIPTION_BACKFILL_MONTHS);
+  const backfillFloor = addMonths(currentMonth, -SUBSCRIPTION_BACKFILL_MONTHS);
+  // Never bill earlier than the accounting-start month (set by the reset), so
+  // purged pre-reset months can't be regenerated.
+  const floorMonth = accountingStartMonth && accountingStartMonth > backfillFloor ? accountingStartMonth : backfillFloor;
+  const suppressed = new Set(deletedIds);
 
   const billedMonths = {};
   for (const charge of charges) {
@@ -1125,8 +1145,10 @@ function reconcileSubscriptionCharges(clients, charges, autoCreate, today) {
     if (start > currentMonth) continue; // future joining date — nothing to bill yet
     for (const period of monthsThrough(start, currentMonth)) {
       if (billedMonths[client.id]?.has(period)) continue;
+      const id = `sub-${client.id}-${period}`;
+      if (suppressed.has(id)) continue; // therapist deleted this one on purpose
       additions.push({
-        id: `sub-${client.id}-${period}`,
+        id,
         clientId: client.id,
         date: `${period}-01`,
         amount: fee,
@@ -1295,22 +1317,26 @@ function App() {
   // (at their chosen cadence). Runs on mount and whenever clients change (add, edit a day/time,
   // archive); reads the latest sessions via the functional update so it never
   // needs `sessions` in its deps and can't loop. reconcile is idempotent.
+  const accountingStartIso = settings.accountingStartMonth ? `${settings.accountingStartMonth}-01` : '';
   useEffect(() => {
-    setSessions((current) => reconcileRecurringSessions(clients, current, today));
-  }, [clients, today, setSessions]);
+    setSessions((current) => reconcileRecurringSessions(clients, current, today, accountingStartIso));
+  }, [clients, today, accountingStartIso, setSessions]);
 
   // Auto-bill subscription clients a monthly fee (per-session clients are billed
   // on attendance instead). Reads the latest charges via the functional update
   // so it never needs `charges` in its deps and can't loop; reconcile is
   // idempotent and generation-only, so it never touches existing charges.
   useEffect(() => {
-    setCharges((current) => reconcileSubscriptionCharges(clients, current, settings.autoCreateCharges, today));
-  }, [clients, settings.autoCreateCharges, today, setCharges]);
+    setCharges((current) => reconcileSubscriptionCharges(
+      clients, current, settings.autoCreateCharges, today,
+      settings.accountingStartMonth, settings.deletedSubscriptionCharges,
+    ));
+  }, [clients, settings.autoCreateCharges, settings.accountingStartMonth, settings.deletedSubscriptionCharges, today, setCharges]);
 
   // Materialize recurring group meetings, mirroring the individual engine.
   useEffect(() => {
-    setGroupSessions((current) => reconcileGroupSessions(groups, current, today));
-  }, [groups, today, setGroupSessions]);
+    setGroupSessions((current) => reconcileGroupSessions(groups, current, today, accountingStartIso));
+  }, [groups, today, accountingStartIso, setGroupSessions]);
 
   const ledgers = useMemo(() => {
     return clients.map((client) => {
@@ -1604,7 +1630,19 @@ function App() {
     const removed = charges.find((charge) => charge.id === id);
     if (!removed) return;
     const linkedSessionIds = sessions.filter((session) => session.chargeId === id).map((session) => session.id);
+    // Subscription charges are auto-generated, so remember this deletion or the
+    // next reconcile would recreate the same id. Attendance charges aren't
+    // regenerated, so they need no tombstone.
+    const isSubscription = removed.reason === 'Subscription Fee';
     setCharges((current) => current.filter((charge) => charge.id !== id));
+    if (isSubscription) {
+      setSettings((current) => ({
+        ...current,
+        deletedSubscriptionCharges: (current.deletedSubscriptionCharges || []).includes(id)
+          ? current.deletedSubscriptionCharges
+          : [...(current.deletedSubscriptionCharges || []), id],
+      }));
+    }
     if (linkedSessionIds.length) {
       setSessions((current) => current.map((session) => (session.chargeId === id ? { ...session, chargeId: null } : session)));
     }
@@ -1612,6 +1650,12 @@ function App() {
       label: 'Undo',
       onClick: () => {
         setCharges((current) => (current.some((charge) => charge.id === removed.id) ? current : [...current, removed]));
+        if (isSubscription) {
+          setSettings((current) => ({
+            ...current,
+            deletedSubscriptionCharges: (current.deletedSubscriptionCharges || []).filter((chargeId) => chargeId !== id),
+          }));
+        }
         if (linkedSessionIds.length) {
           setSessions((current) =>
             current.map((session) => (linkedSessionIds.includes(session.id) ? { ...session, chargeId: removed.id } : session)),
@@ -1638,6 +1682,12 @@ function App() {
     if (!window.confirm(message)) return;
     const ids = new Set(recurringMembers.map((client) => client.id));
     setClients((current) => current.map((client) => (ids.has(client.id) ? { ...client, scheduleType: 'Manual' } : client)));
+    // Clear their leftover 1:1 chips from the calendar so they only appear via
+    // the group. Only unmarked (Scheduled) sessions go — marked ones carry
+    // attendance/charges and are kept as history.
+    setSessions((current) =>
+      current.filter((session) => !(ids.has(session.clientId) && session.status === 'Scheduled')),
+    );
   }
 
   function addGroup(draft) {
@@ -1794,6 +1844,34 @@ function App() {
     setPayments(SAMPLE_PAYMENTS);
     setSelectedClientId(SAMPLE_CLIENTS[0].id);
     showNotice('Sample data loaded.');
+  }
+
+  // One-time clean slate: back up to Drive, then permanently delete everything
+  // dated before the reset boundary (sessions, group sessions, charges,
+  // payments) and floor subscription billing there so nothing regenerates.
+  // Clients, groups and their schedules are kept; balances reset to zero.
+  async function startFreshFromOct1() {
+    const signedIn = Boolean(drive?.signedIn);
+    const warning = signedIn
+      ? 'Start fresh from 1 Oct 2026?\n\nA dated backup is saved to Google Drive first, then everything before 1 Oct — sessions, group sessions, charges and payments — is permanently deleted. Clients, groups and schedules are kept, and all balances reset to zero.'
+      : 'Start fresh from 1 Oct 2026?\n\nYou are NOT signed in to Google Drive, so no backup can be saved and this cannot be undone. Everything before 1 Oct — sessions, group sessions, charges and payments — will be permanently deleted. Clients, groups and schedules are kept, and all balances reset to zero.';
+    if (!window.confirm(warning)) return;
+
+    if (signedIn) {
+      const result = await drive.backupNow();
+      if (!result?.ok) {
+        showNotice(result?.error || 'Backup failed — reset cancelled.');
+        return;
+      }
+    }
+
+    const beforeCutoff = (item) => (item.date || '') < ACCOUNTING_RESET_DATE;
+    setSessions((current) => current.filter((session) => !beforeCutoff(session)));
+    setGroupSessions((current) => current.filter((gs) => !beforeCutoff(gs)));
+    setCharges((current) => current.filter((charge) => !beforeCutoff(charge)));
+    setPayments((current) => current.filter((payment) => !beforeCutoff(payment)));
+    setSettings((current) => ({ ...current, accountingStartMonth: ACCOUNTING_RESET_MONTH }));
+    showNotice('Fresh start from 1 Oct 2026 — earlier data cleared.');
   }
 
   function exportJson() {
@@ -1997,7 +2075,7 @@ function App() {
               />
             )}
 
-            {activeNav === 'Settings' && <SettingsScreen settings={settings} setSettings={setSettings} loadSampleData={loadSampleData} exportJson={exportJson} drive={drive} onNotice={showNotice} />}
+            {activeNav === 'Settings' && <SettingsScreen settings={settings} setSettings={setSettings} loadSampleData={loadSampleData} exportJson={exportJson} startFresh={startFreshFromOct1} drive={drive} onNotice={showNotice} />}
           </div>
         </section>
       </div>
@@ -4190,7 +4268,8 @@ function ReminderTemplateEditor({ settings, setSettings }) {
   );
 }
 
-function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, drive, onNotice }) {
+function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, startFresh, drive, onNotice }) {
+  const resetDone = settings.accountingStartMonth === ACCOUNTING_RESET_MONTH;
   return (
     <div className="grid gap-5 xl:grid-cols-2">
       <Panel>
@@ -4218,6 +4297,22 @@ function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, dri
           </div>
         </div>
         <BackupManager drive={drive} onNotice={onNotice} />
+        <div className="mt-4 rounded-md border border-red-200 bg-red-50/60 p-4">
+          <p className="text-sm font-semibold text-red-800">Start fresh from 1 Oct 2026</p>
+          <p className="mt-1 text-sm text-[var(--subtle)]">
+            {resetDone
+              ? 'Done — accounting now runs from 1 Oct 2026. Sessions, charges and payments before then were cleared; clients, groups and schedules were kept.'
+              : 'Permanently deletes all sessions, charges and payments dated before 1 Oct 2026 and resets every balance to zero. Clients, groups and schedules are kept. A Drive backup is saved first.'}
+          </p>
+          {!resetDone && (
+            <div className="mt-3">
+              <button className="icon-button border-red-300 text-red-700 hover:bg-red-100" type="button" onClick={startFresh}>
+                <RefreshCcw size={17} />
+                Start fresh from 1 Oct
+              </button>
+            </div>
+          )}
+        </div>
       </Panel>
       <Panel>
         <h3 className="section-title">Billing and Reminders</h3>
