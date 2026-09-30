@@ -865,7 +865,6 @@ function runClientImport({ rows, mapping, hasHeader, existingClients }) {
   const seen = new Set((existingClients || []).map((c) => `${normName(c.name)}|${normPhone(c.phone)}`));
   const accepted = [];
   const skipped = [];
-  const stamp = Date.now();
 
   dataRows.forEach((raw, i) => {
     if (raw.every((cell) => String(cell ?? '').trim() === '')) return;
@@ -882,7 +881,7 @@ function runClientImport({ rows, mapping, hasHeader, existingClients }) {
     const key = `${normName(name)}|${normPhone(client.phone)}`;
     if (seen.has(key)) { skipped.push({ row: rowNum, name, reason: 'duplicate (Name + Phone)' }); return; }
     seen.add(key);
-    client.id = `c${stamp}${accepted.length}`;
+    client.id = newId('c');
     accepted.push({ client, warnings });
   });
 
@@ -981,6 +980,18 @@ function frequencyLabel(frequency) {
 
 function isoOf(date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+// Collision-resistant id for a new record. Date.now() alone repeats when two
+// records are minted in the same millisecond (e.g. marking several group members
+// present), which would clash as keys in allocateLedger. crypto.randomUUID is
+// used where available, with a random fallback for non-secure contexts.
+function newId(prefix) {
+  const unique =
+    typeof globalThis.crypto?.randomUUID === 'function'
+      ? globalThis.crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  return `${prefix}-${unique}`;
 }
 
 function isoAddDays(iso, days) {
@@ -1500,7 +1511,7 @@ function App() {
 
     if (settings.autoCreateCharges && nextStatus === 'Present' && client.billingModel === 'Per Session') {
       newCharge = {
-        id: `ch${Date.now()}`,
+        id: newId('ch'),
         clientId: client.id,
         date: session.date,
         amount: client.sessionRate,
@@ -1512,7 +1523,7 @@ function App() {
     if (settings.autoCreateCharges && nextStatus === 'Late Cancel' && client.billingModel === 'Per Session') {
       const percent = client.cancellationRule === 'Custom' ? client.customCharge : settings.lateCancellationCharge;
       newCharge = {
-        id: `ch${Date.now()}`,
+        id: newId('ch'),
         clientId: client.id,
         date: session.date,
         amount: Math.round((client.sessionRate * percent) / 100),
@@ -1555,14 +1566,16 @@ function App() {
     if (!date) {
       const fallback = new Date(`${session.date}T${session.time || '00:00'}`);
       fallback.setDate(fallback.getDate() + 7);
-      date = fallback.toISOString().slice(0, 10);
+      // Local date parts — toISOString() is UTC and can roll to the wrong day
+      // for evening sessions in ahead-of-UTC zones (e.g. IST).
+      date = isoOf(fallback);
     }
     const time = newTime || session.time;
     const clash = firstClash(occupancyBlocks, { date, time, duration: session.duration }, sessionId);
     if (clash && !window.confirm(clashPrompt(clash, 'Move anyway?'))) return;
     const replacement = {
       ...session,
-      id: `s${Date.now()}`,
+      id: newId('s'),
       date,
       time,
       status: 'Scheduled',
@@ -1595,7 +1608,7 @@ function App() {
     setSessions((current) => [
       ...current,
       {
-        id: `s${Date.now()}`,
+        id: newId('s'),
         clientId: draft.clientId,
         date: draft.date,
         time: draft.time,
@@ -1621,7 +1634,7 @@ function App() {
     setPayments((current) => [
       ...current,
       {
-        id: `p${Date.now()}`,
+        id: newId('p'),
         clientId: paymentDraft.clientId,
         date: today,
         period,
@@ -1640,7 +1653,7 @@ function App() {
   function addClient(event) {
     event.preventDefault();
     if (!clientDraft.name.trim()) return;
-    const id = `c${Date.now()}`;
+    const id = newId('c');
     const nextClient = { ...clientDraft, id, tags: clientDraft.tags.split(',').map((tag) => tag.trim()).filter(Boolean) };
     setClients((current) => [...current, nextClient]);
     setSelectedClientId(id);
@@ -1728,7 +1741,7 @@ function App() {
     if (!String(draft.name || '').trim()) return false;
     const group = {
       ...draft,
-      id: `g${Date.now()}`,
+      id: newId('g'),
       name: draft.name.trim(),
       capacity: Number(draft.capacity) || 0,
       sessionFee: Number(draft.sessionFee) || 0,
@@ -1772,7 +1785,7 @@ function App() {
     setGroupSessions((current) => [
       ...current,
       {
-        id: `gs${Date.now()}`,
+        id: newId('gs'),
         groupId: draft.groupId,
         date: draft.date,
         time: draft.time,
@@ -1813,7 +1826,7 @@ function App() {
     let removeChargeId = null;
     if (status === 'Present') {
       if (bills && !prior.chargeId) {
-        addCharge = { id: `ch${Date.now()}`, clientId, date: gs.date, amount: fee, reason: 'Group Session', status: 'Pending' };
+        addCharge = { id: newId('ch'), clientId, date: gs.date, amount: fee, reason: 'Group Session', status: 'Pending' };
         newChargeId = addCharge.id;
       }
     } else if (prior.chargeId) {
