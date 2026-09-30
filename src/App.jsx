@@ -38,6 +38,7 @@ import {
   Copy,
 } from 'lucide-react';
 import { useGoogleDrive } from './googleDrive.js';
+import { LANGUAGES, setActiveLanguage, localeForLanguage, t } from './i18n.js';
 
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || '';
 
@@ -113,6 +114,7 @@ const initialSettings = {
   practiceName: '',
   paymentDetails: '',
   currency: 'INR',
+  language: 'en',
   // Branding shown on statements/invoices. Images are small resized PNG data
   // URLs (see resizeImageFile); signatureName defaults to therapistName.
   logo: '',
@@ -321,9 +323,9 @@ function toDate(value) {
 
 function greetingFor(date = new Date()) {
   const hour = date.getHours();
-  if (hour < 12) return 'Good Morning';
-  if (hour < 17) return 'Good Afternoon';
-  return 'Good Evening';
+  if (hour < 12) return t('greeting.morning');
+  if (hour < 17) return t('greeting.afternoon');
+  return t('greeting.evening');
 }
 
 function formatDate(value, options = { day: '2-digit', month: 'short' }) {
@@ -1924,6 +1926,7 @@ function App() {
   }
 
   setActiveCurrency(settings.currency);
+  setActiveLanguage(settings.language);
 
   const gate = settings.profileComplete ? 'app' : drive.signedIn ? 'setup' : 'signin';
 
@@ -1956,12 +1959,12 @@ function App() {
                 }`}
               >
                 <Icon size={18} />
-                {label}
+                {t(`nav.${label.toLowerCase()}`)}
               </button>
             ))}
           </nav>
           <div className="mt-8 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
-            <p className="text-xs font-semibold uppercase tracking-wide text-[var(--subtle)]">Google Drive shape</p>
+            <p className="text-xs font-semibold uppercase tracking-wide text-[var(--subtle)]">{t('sidebar.driveShape')}</p>
             {['clients.json', 'groups.json', 'sessions.json', 'groupsessions.json', 'charges.json', 'payments.json', 'settings.json'].map((file) => (
               <div key={file} className="mt-2 flex items-center gap-2 text-sm text-[var(--subtle)]">
                 <FileJson size={15} />
@@ -2424,7 +2427,7 @@ function Brand() {
 }
 
 function TopBar({ settings, drive, signOut, today }) {
-  const currentDate = toDate(today).toLocaleDateString('en-IN', { weekday: 'long', month: 'long', day: 'numeric' });
+  const currentDate = toDate(today).toLocaleDateString(localeForLanguage(), { weekday: 'long', month: 'long', day: 'numeric' });
   return (
     <header className="mb-5 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
       <div>
@@ -2438,7 +2441,7 @@ function TopBar({ settings, drive, signOut, today }) {
           {drive.signedIn && (
             <button className="icon-button" type="button" onClick={signOut}>
               <LogOut size={17} />
-              Sign out
+              {t('drive.signOut')}
             </button>
           )}
         </div>
@@ -2455,15 +2458,15 @@ function DriveButton({ drive }) {
     return (
       <span className="inline-flex items-center gap-2 rounded-md border border-[var(--line)] bg-[var(--accent-soft)] px-3 py-2 text-sm font-medium text-[var(--primary-dark)]">
         <Cloud size={17} />
-        Syncing…
+        {t('drive.syncing')}
       </span>
     );
   }
 
   if (signedIn && status === 'connected') {
     const syncedLabel = lastSyncedAt
-      ? `Synced ${new Date(lastSyncedAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}`
-      : 'Synced';
+      ? t('drive.syncedAt', { time: new Date(lastSyncedAt).toLocaleTimeString(localeForLanguage(), { hour: '2-digit', minute: '2-digit' }) })
+      : t('drive.synced');
     return (
       <span className="inline-flex items-center gap-2 rounded-md border border-[var(--line)] bg-[var(--accent-soft)] px-3 py-2 text-sm font-medium text-[var(--primary-dark)]">
         <Cloud size={17} />
@@ -2474,9 +2477,9 @@ function DriveButton({ drive }) {
 
   // Cached/offline: data is safe locally, but not syncing until re-auth.
   return (
-    <button className="icon-button" type="button" onClick={connect} title="Sign in to sync with Google Drive">
+    <button className="icon-button" type="button" onClick={connect} title={t('drive.signInTitle')}>
       <CloudOff size={17} />
-      Sign in to sync
+      {t('drive.signIn')}
     </button>
   );
 }
@@ -2496,7 +2499,7 @@ function MobileNav({ activeNav, setActiveNav }) {
             }`}
           >
             <Icon size={16} />
-            {label}
+            {t(`nav.${label.toLowerCase()}`)}
           </button>
         ))}
       </div>
@@ -4370,6 +4373,13 @@ function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, sta
           <Input label="Practice Name" value={settings.practiceName} onChange={(value) => setSettings({ ...settings, practiceName: value })} />
           <Input label="Payment Details (UPI / bank)" value={settings.paymentDetails || ''} onChange={(value) => setSettings({ ...settings, paymentDetails: value })} />
           <Select label="Currency" value={settings.currency || 'INR'} options={CURRENCY_OPTIONS} onChange={(value) => setSettings({ ...settings, currency: value })} />
+          <Select
+            label={t('settings.language')}
+            value={settings.language || 'en'}
+            options={LANGUAGES.map(([code]) => code)}
+            labels={Object.fromEntries(LANGUAGES)}
+            onChange={(value) => setSettings({ ...settings, language: value })}
+          />
         </div>
         <div className="mt-5 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
           <p className="text-sm font-semibold">Branding</p>
