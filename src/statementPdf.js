@@ -20,6 +20,18 @@ function renderStatement(doc, statement, settings, label, money) {
   const rightX = 190;
   let y = 24;
 
+  // Practice logo, top-right, scaled to a fixed height by its aspect ratio.
+  if (settings.logo) {
+    try {
+      const props = doc.getImageProperties(settings.logo);
+      const h = 16;
+      const w = Math.min(55, (h * props.width) / props.height);
+      doc.addImage(settings.logo, 'PNG', rightX - w, 12, w, h);
+    } catch {
+      // A bad or unreadable image just means no logo — never block the PDF.
+    }
+  }
+
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(18);
   doc.text(settings.practiceName || 'Practice', marginX, y);
@@ -101,6 +113,31 @@ function renderStatement(doc, statement, settings, label, money) {
     doc.text(money(statement.credit), rightX, y, { align: 'right' });
   } else {
     doc.text('Balance settled — thank you!', marginX, y);
+  }
+
+  // Signature block, below the balance.
+  const signatureName = settings.signatureName || settings.therapistName;
+  if (settings.signatureImage || signatureName) {
+    y += 22;
+    if (settings.signatureImage) {
+      try {
+        const props = doc.getImageProperties(settings.signatureImage);
+        const h = 16;
+        const w = Math.min(60, (h * props.width) / props.height);
+        doc.addImage(settings.signatureImage, 'PNG', marginX, y, w, h);
+        y += h + 2;
+      } catch {
+        // Ignore an unusable signature image; the name line still prints.
+      }
+    }
+    doc.setDrawColor(210);
+    doc.line(marginX, y, marginX + 60, y);
+    y += 5;
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(10);
+    doc.setTextColor(90);
+    if (signatureName) doc.text(signatureName, marginX, y);
+    doc.setTextColor(30);
   }
 }
 

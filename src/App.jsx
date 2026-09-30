@@ -27,6 +27,7 @@ import {
   Search,
   Settings,
   Trash2,
+  Upload,
   Users,
   WalletCards,
   X,
@@ -112,6 +113,11 @@ const initialSettings = {
   practiceName: '',
   paymentDetails: '',
   currency: 'INR',
+  // Branding shown on statements/invoices. Images are small resized PNG data
+  // URLs (see resizeImageFile); signatureName defaults to therapistName.
+  logo: '',
+  signatureImage: '',
+  signatureName: '',
   autoCreateCharges: true,
   lateCancellationHours: 24,
   lateCancellationCharge: 100,
@@ -433,7 +439,7 @@ function formatStatementText(statement, settings) {
   } else {
     lines.push('Balance settled — thank you!');
   }
-  lines.push('', `— ${settings.therapistName}`);
+  lines.push('', `— ${settings.signatureName || settings.therapistName}`);
   return lines.join('\n');
 }
 
@@ -492,6 +498,32 @@ function reminderValues(statement, settings, label) {
 function formatReminderText(statement, settings, label) {
   const template = settings.reminderTemplate || DEFAULT_REMINDER_TEMPLATE;
   return renderTemplate(template, reminderValues(statement, settings, label));
+}
+
+// Read an image file and return a resized PNG data URL, capped to maxDim on its
+// longest side so branding stays small enough to keep in settings and sync to
+// Drive. PNG preserves logo/signature transparency.
+function resizeImageFile(file, maxDim = 320) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Could not read the file.'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('That image could not be loaded.'));
+      img.onload = () => {
+        const scale = Math.min(1, maxDim / Math.max(img.width, img.height) || 1);
+        const w = Math.max(1, Math.round(img.width * scale));
+        const h = Math.max(1, Math.round(img.height * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL('image/png'));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
 }
 
 // Deep links that open a prefilled message for the therapist to review and send
@@ -4146,9 +4178,19 @@ function StatementCard({ statement, client, settings, periodLabel, onCopy, onDow
 
   const shareText = formatStatementText(statement, settings);
   const subject = `Statement for ${periodLabel} — ${settings.practiceName}`;
+  const signatureName = settings.signatureName || settings.therapistName;
 
   return (
     <Panel>
+      {(settings.logo || settings.practiceName) && (
+        <div className="mb-3 flex items-center gap-3 border-b border-[var(--line)] pb-3">
+          {settings.logo && <img src={settings.logo} alt="Practice logo" className="h-10 max-w-[120px] object-contain" />}
+          <div>
+            {settings.practiceName && <p className="font-semibold leading-tight">{settings.practiceName}</p>}
+            {settings.therapistName && <p className="text-sm text-[var(--subtle)]">{settings.therapistName}</p>}
+          </div>
+        </div>
+      )}
       <div className="flex items-start justify-between gap-3">
         <div>
           <h4 className="text-lg font-semibold">{statement.clientName}</h4>
@@ -4171,6 +4213,12 @@ function StatementCard({ statement, client, settings, periodLabel, onCopy, onDow
           <span>{closing[1]}</span>
         </div>
       </div>
+      {(settings.signatureImage || signatureName) && (
+        <div className="mt-4">
+          {settings.signatureImage && <img src={settings.signatureImage} alt="Signature" className="h-12 max-w-[180px] object-contain" />}
+          {signatureName && <p className="mt-1 border-t border-[var(--line)] pt-1 text-sm font-medium">{signatureName}</p>}
+        </div>
+      )}
       <div className="mt-3">
         <ShareActions
           waUrl={whatsappUrl(client?.phone, shareText)}
@@ -4268,6 +4316,49 @@ function ReminderTemplateEditor({ settings, setSettings }) {
   );
 }
 
+function ImageUpload({ label, value, onChange, hint, maxDim, onError }) {
+  const inputRef = useRef(null);
+  async function handleFile(event) {
+    const file = event.target.files?.[0];
+    event.target.value = ''; // allow re-picking the same file
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      onError?.('Please choose an image file.');
+      return;
+    }
+    try {
+      onChange(await resizeImageFile(file, maxDim));
+    } catch (err) {
+      onError?.(err.message || 'That image could not be used.');
+    }
+  }
+  return (
+    <div>
+      <span className="text-sm font-medium text-[var(--subtle)]">{label}</span>
+      <div className="mt-1 flex items-center gap-3">
+        {value ? (
+          <img src={value} alt={label} className="h-12 max-w-[128px] rounded border border-[var(--line)] bg-white object-contain p-1" />
+        ) : (
+          <div className="flex h-12 w-[128px] items-center justify-center rounded border border-dashed border-[var(--line)] text-xs text-[var(--subtle)]">None</div>
+        )}
+        <div className="flex flex-col gap-1">
+          <button type="button" className="icon-button px-3 py-1.5 text-xs" onClick={() => inputRef.current?.click()}>
+            <Upload size={14} />
+            {value ? 'Replace' : 'Upload'}
+          </button>
+          {value && (
+            <button type="button" className="text-left text-xs font-medium text-red-600 hover:underline" onClick={() => onChange('')}>
+              Remove
+            </button>
+          )}
+        </div>
+        <input ref={inputRef} type="file" accept="image/*" className="hidden" onChange={handleFile} />
+      </div>
+      {hint && <p className="mt-1 text-xs text-[var(--subtle)]">{hint}</p>}
+    </div>
+  );
+}
+
 function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, startFresh, drive, onNotice }) {
   const resetDone = settings.accountingStartMonth === ACCOUNTING_RESET_MONTH;
   return (
@@ -4279,6 +4370,34 @@ function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, sta
           <Input label="Practice Name" value={settings.practiceName} onChange={(value) => setSettings({ ...settings, practiceName: value })} />
           <Input label="Payment Details (UPI / bank)" value={settings.paymentDetails || ''} onChange={(value) => setSettings({ ...settings, paymentDetails: value })} />
           <Select label="Currency" value={settings.currency || 'INR'} options={CURRENCY_OPTIONS} onChange={(value) => setSettings({ ...settings, currency: value })} />
+        </div>
+        <div className="mt-5 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
+          <p className="text-sm font-semibold">Branding</p>
+          <p className="mt-1 text-sm text-[var(--subtle)]">Shown on statements and invoices you share or download.</p>
+          <div className="mt-3 grid gap-4">
+            <ImageUpload
+              label="Practice logo"
+              value={settings.logo || ''}
+              onChange={(value) => setSettings({ ...settings, logo: value })}
+              onError={onNotice}
+              maxDim={320}
+              hint="Appears at the top of each statement. PNG or JPG."
+            />
+            <ImageUpload
+              label="Signature"
+              value={settings.signatureImage || ''}
+              onChange={(value) => setSettings({ ...settings, signatureImage: value })}
+              onError={onNotice}
+              maxDim={400}
+              hint="A scan or image of your signature, shown above your name."
+            />
+            <Input
+              label="Signature name"
+              value={settings.signatureName || ''}
+              onChange={(value) => setSettings({ ...settings, signatureName: value })}
+            />
+            <p className="-mt-2 text-xs text-[var(--subtle)]">Defaults to your therapist name if left blank.</p>
+          </div>
         </div>
         <div className="mt-5 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
           <p className="text-sm font-semibold">Account &amp; data</p>
