@@ -1514,36 +1514,48 @@ function App() {
 
   function statusSession(sessionId, nextStatus) {
     const session = sessions.find((item) => item.id === sessionId);
+    // A: re-tapping the status a session is already in is a no-op — otherwise it
+    // would mint a second charge for the same attendance.
+    if (!session || session.status === nextStatus) return;
     const client = clientById[session.clientId];
+
     let newCharge = null;
-
-    if (settings.autoCreateCharges && nextStatus === 'Present' && client.billingModel === 'Per Session') {
-      newCharge = {
-        id: newId('ch'),
-        clientId: client.id,
-        date: session.date,
-        amount: client.sessionRate,
-        reason: 'Session Fee',
-        status: 'Pending',
-      };
+    if (settings.autoCreateCharges && client.billingModel === 'Per Session') {
+      if (nextStatus === 'Present') {
+        newCharge = {
+          id: newId('ch'),
+          clientId: client.id,
+          date: session.date,
+          amount: client.sessionRate,
+          reason: 'Session Fee',
+          status: 'Pending',
+        };
+      } else if (nextStatus === 'Late Cancel') {
+        const percent = client.cancellationRule === 'Custom' ? client.customCharge : settings.lateCancellationCharge;
+        newCharge = {
+          id: newId('ch'),
+          clientId: client.id,
+          date: session.date,
+          amount: Math.round((client.sessionRate * percent) / 100),
+          reason: 'Late Cancellation',
+          status: 'Pending',
+        };
+      }
     }
+    // Only a charge that actually gets added should be linked to the session.
+    const addCharge = newCharge && newCharge.amount > 0 ? newCharge : null;
 
-    if (settings.autoCreateCharges && nextStatus === 'Late Cancel' && client.billingModel === 'Per Session') {
-      const percent = client.cancellationRule === 'Custom' ? client.customCharge : settings.lateCancellationCharge;
-      newCharge = {
-        id: newId('ch'),
-        clientId: client.id,
-        date: session.date,
-        amount: Math.round((client.sessionRate * percent) / 100),
-        reason: 'Late Cancellation',
-        status: 'Pending',
-      };
-    }
-
+    // B: a session owns at most one auto-charge. Drop the charge from its previous
+    // status before adding the new one (or none for Cancelled/Scheduled), so
+    // switching status never orphans a charge that keeps inflating the balance.
+    const priorChargeId = session.chargeId;
     setSessions((current) =>
-      current.map((item) => (item.id === sessionId ? { ...item, status: nextStatus, chargeId: newCharge?.id || item.chargeId } : item)),
+      current.map((item) => (item.id === sessionId ? { ...item, status: nextStatus, chargeId: addCharge?.id || null } : item)),
     );
-    if (newCharge && newCharge.amount > 0) setCharges((current) => [...current, newCharge]);
+    setCharges((current) => {
+      const pruned = priorChargeId ? current.filter((charge) => charge.id !== priorChargeId) : current;
+      return addCharge ? [...pruned, addCharge] : pruned;
+    });
     showNotice(`${client.name} marked ${nextStatus.toLowerCase()}.`, {
       label: 'Undo',
       onClick: () => undoSession(sessionId),
