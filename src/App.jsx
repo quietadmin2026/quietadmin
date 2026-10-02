@@ -12,7 +12,6 @@ import {
   Clock3,
   CreditCard,
   Download,
-  FileJson,
   FolderOpen,
   History,
   Import,
@@ -29,7 +28,6 @@ import {
   Trash2,
   Upload,
   Users,
-  WalletCards,
   X,
   Cloud,
   CloudOff,
@@ -4726,22 +4724,6 @@ function BackupManager({ drive, onNotice }) {
 
 function Panel({ children }) {
   return <section className="surface rounded-md border p-4 shadow-soft sm:p-5">{children}</section>;
-}
-
-function StatCard({ title, value, icon: Icon }) {
-  return (
-    <Panel>
-      <div className="flex items-center justify-between gap-4">
-        <div>
-          <p className="text-sm text-[var(--subtle)]">{title}</p>
-          <p className="mt-2 text-2xl font-semibold">{value}</p>
-        </div>
-        <div className="grid h-11 w-11 place-items-center rounded-md bg-[var(--accent-soft)] text-[var(--primary)]">
-          <Icon size={21} />
-        </div>
-      </div>
-    </Panel>
-  );
 }
 
 function MiniMetric({ label, value }) {
