@@ -2043,15 +2043,6 @@ function App() {
               </button>
             ))}
           </nav>
-          <div className="mt-8 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
-            <p className="text-xs font-semibold uppercase tracking-wide text-[var(--subtle)]">{t('sidebar.driveShape')}</p>
-            {['clients.json', 'groups.json', 'sessions.json', 'groupsessions.json', 'charges.json', 'payments.json', 'settings.json'].map((file) => (
-              <div key={file} className="mt-2 flex items-center gap-2 text-sm text-[var(--subtle)]">
-                <FileJson size={15} />
-                {file}
-              </div>
-            ))}
-          </div>
         </aside>
 
         <section className="min-w-0 flex-1">
@@ -2186,6 +2177,7 @@ function App() {
                   collectionRate: billedThisMonth ? Math.round((collectedThisMonth / billedThisMonth) * 100) : 0,
                   lateCancels: lateCancelsThisMonth,
                 }}
+                trends={trends}
                 exportJson={exportJson}
               />
             )}
@@ -2841,81 +2833,72 @@ function Dashboard({ settings, view, setView, sessions, clients, clientList, led
 
   return (
     <div className="space-y-5">
-      <ClientSearch clientList={clientList} ledgerByClient={ledgerByClient} goToClient={goToClient} />
-      {settings.outstandingReminders && outstandingClients.length > 0 && (
-        <button
-          type="button"
-          onClick={() => setActiveNav('Statements')}
-          className="flex w-full items-center gap-3 rounded-md border border-[var(--line)] bg-[var(--accent-soft)] px-4 py-3 text-left transition hover:brightness-95"
-        >
-          <Mail size={18} className="shrink-0 text-[var(--primary)]" />
-          <span className="text-sm">
-            <span className="font-semibold">{outstandingClients.length} client{outstandingClients.length === 1 ? '' : 's'} with {formatMoney(stats.outstanding)} outstanding.</span>{' '}
-            <span className="text-[var(--subtle)]">Review statements and send reminders →</span>
-          </span>
-        </button>
-      )}
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard title="Today's Sessions" value={stats.today} icon={CalendarDays} />
-        <StatCard title="Outstanding Amount" value={formatMoney(stats.outstanding)} icon={WalletCards} />
-        <StatCard title="Collected This Month" value={formatMoney(stats.collected)} icon={CreditCard} />
-        <StatCard title="Late Cancellations This Month" value={stats.lateCancels} icon={Clock3} />
+      {/* Quiet, compact quick-jump search — present but not the hero. */}
+      <div className="flex justify-end">
+        <div className="w-full sm:max-w-xs">
+          <ClientSearch clientList={clientList} ledgerByClient={ledgerByClient} goToClient={goToClient} />
+        </div>
       </div>
 
-      <TrendsPanel trends={trends} />
+      {/* PRIMARY: today's sessions. Attendance rows are unchanged. */}
+      <Panel>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h3 className="section-title">
+              {view === 'Today' ? 'Today’s sessions' : view === 'Week' ? 'This week’s sessions' : 'This month’s sessions'}
+            </h3>
+            <p className="section-subtitle">Mark attendance as you go.</p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Segmented options={['Today', 'Week', 'Month']} value={view} onChange={setView} />
+            <button
+              type="button"
+              className={`icon-button px-3 py-2 text-xs${adding ? ' is-active' : ''}`}
+              onClick={() => setAdding((open) => !open)}
+            >
+              <Plus size={15} />
+              Add session
+            </button>
+          </div>
+        </div>
 
-      <section className="grid gap-5 xl:grid-cols-[1.35fr_0.9fr]">
-        <Panel>
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <h3 className="section-title">Sessions</h3>
-              <p className="section-subtitle">Recurring clients fill in automatically. Auto charge is {settings.autoCreateCharges ? 'on' : 'off'}.</p>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <Segmented options={['Today', 'Week', 'Month']} value={view} onChange={setView} />
-              <button
-                type="button"
-                className={`icon-button px-3 py-2 text-xs${adding ? ' is-active' : ''}`}
-                onClick={() => setAdding((open) => !open)}
-              >
-                <Plus size={15} />
-                Add session
+        {adding && (
+          <form onSubmit={submitSession} className="mt-4 grid gap-3 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4 sm:grid-cols-2">
+            {activeClients.length === 0 ? (
+              <p className="text-sm text-[var(--subtle)] sm:col-span-2">Add an active client first, then you can schedule a session.</p>
+            ) : (
+              <>
+                <Select
+                  label="Client"
+                  value={draft.clientId || activeClients[0].id}
+                  options={activeClients.map((client) => client.id)}
+                  labels={Object.fromEntries(activeClients.map((client) => [client.id, client.name]))}
+                  onChange={(value) => setDraft((current) => ({ ...current, clientId: value }))}
+                />
+                <Input label="Date" type="date" value={draft.date} onChange={(value) => setDraft((current) => ({ ...current, date: value }))} />
+                <Input label="Time" type="time" value={draft.time} onChange={(value) => setDraft((current) => ({ ...current, time: value }))} />
+                <Input label="Duration (min)" type="number" value={draft.duration} onChange={(value) => setDraft((current) => ({ ...current, duration: value }))} />
+                <div className="flex gap-2 sm:col-span-2">
+                  <button type="submit" className="rounded-md bg-[var(--primary)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--primary-dark)]">Add session</button>
+                  <button type="button" className="icon-button px-4 py-2 text-sm" onClick={() => setAdding(false)}>Cancel</button>
+                </div>
+              </>
+            )}
+          </form>
+        )}
+
+        <div className="mt-4 space-y-3">
+          {sessions.length === 0 ? (
+            <div className="rounded-md border border-dashed border-[var(--line)] bg-[var(--bg)] px-4 py-10 text-center">
+              <p className="text-base font-medium">A quiet day.</p>
+              <p className="mt-1 text-sm text-[var(--subtle)]">You have no sessions scheduled {view === 'Today' ? 'today' : `this ${view.toLowerCase()}`}.</p>
+              <button type="button" className="icon-button mx-auto mt-3" onClick={() => setActiveNav('Schedule')}>
+                <CalendarDays size={16} />
+                View schedule
               </button>
             </div>
-          </div>
-
-          {adding && (
-            <form onSubmit={submitSession} className="mt-4 grid gap-3 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4 sm:grid-cols-2">
-              {activeClients.length === 0 ? (
-                <p className="text-sm text-[var(--subtle)] sm:col-span-2">Add an active client first, then you can schedule a session.</p>
-              ) : (
-                <>
-                  <Select
-                    label="Client"
-                    value={draft.clientId || activeClients[0].id}
-                    options={activeClients.map((client) => client.id)}
-                    labels={Object.fromEntries(activeClients.map((client) => [client.id, client.name]))}
-                    onChange={(value) => setDraft((current) => ({ ...current, clientId: value }))}
-                  />
-                  <Input label="Date" type="date" value={draft.date} onChange={(value) => setDraft((current) => ({ ...current, date: value }))} />
-                  <Input label="Time" type="time" value={draft.time} onChange={(value) => setDraft((current) => ({ ...current, time: value }))} />
-                  <Input label="Duration (min)" type="number" value={draft.duration} onChange={(value) => setDraft((current) => ({ ...current, duration: value }))} />
-                  <div className="flex gap-2 sm:col-span-2">
-                    <button type="submit" className="rounded-md bg-[var(--primary)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--primary-dark)]">Add session</button>
-                    <button type="button" className="icon-button px-4 py-2 text-sm" onClick={() => setAdding(false)}>Cancel</button>
-                  </div>
-                </>
-              )}
-            </form>
-          )}
-
-          <div className="mt-4 space-y-3">
-            {sessions.length === 0 && (
-              <p className="rounded-md border border-dashed border-[var(--line)] bg-[var(--bg)] px-4 py-6 text-center text-sm text-[var(--subtle)]">
-                No sessions for {view === 'Today' ? 'today' : `this ${view.toLowerCase()}`}. Recurring clients appear here automatically, or use Add session.
-              </p>
-            )}
-            {sessions.map((session) => {
+          ) : (
+            sessions.map((session) => {
               const client = clients[session.clientId];
               if (!client) return null;
               const ledger = ledgerByClient[session.clientId];
@@ -2943,49 +2926,57 @@ function Dashboard({ settings, view, setView, sessions, clients, clientList, led
                   </div>
                 </article>
               );
-            })}
-          </div>
-        </Panel>
+            })
+          )}
+        </div>
+      </Panel>
 
-        <Panel>
-          <h3 className="section-title">Money</h3>
-          <p className="section-subtitle">Clients with open balances and quick follow-up actions.</p>
-          <div className="mt-4 overflow-hidden rounded-md border border-[var(--line)]">
-            <table className="w-full text-left text-sm">
-              <thead className="bg-[var(--panel-muted)] text-xs uppercase text-[var(--subtle)]">
-                <tr>
-                  <th className="px-3 py-3">Client</th>
-                  <th className="px-3 py-3">Outstanding</th>
-                  <th className="px-3 py-3">Credit</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-[var(--line)]">
-                {outstandingClients.map((client) => (
-                  <tr key={client.id} className="bg-[var(--panel)]">
-                    <td className="px-3 py-3 font-medium">{client.name}</td>
-                    <td className="px-3 py-3">{formatMoney(ledgerByClient[client.id].outstanding)}</td>
-                    <td className="px-3 py-3">{formatMoney(ledgerByClient[client.id].credit)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <div className="mt-4 grid gap-2 sm:grid-cols-3">
-            <button className="icon-button" type="button" onClick={() => { setPaymentDraft((draft) => ({ ...draft, clientId: outstandingClients[0]?.id || 'c1' })); setActiveNav('Payments'); }}>
-              <CreditCard size={17} />
-              Record Payment
-            </button>
-            <button className="icon-button" type="button">
-              <MessageCircle size={17} />
-              Send Reminder
-            </button>
-            <button className="icon-button" type="button" onClick={() => setActiveNav('Clients')}>
-              <History size={17} />
-              Timeline
-            </button>
-          </div>
-        </Panel>
-      </section>
+      {/* SECONDARY: money needing attention — a light list, not a ledger table. */}
+      <Panel>
+        <h3 className="section-title">Money needing attention</h3>
+        <p className="section-subtitle">Clients with an open balance.</p>
+        <div className="mt-4 space-y-2">
+          {outstandingClients.length === 0 ? (
+            <p className="rounded-md border border-[var(--line)] bg-[var(--bg)] px-4 py-6 text-center text-sm text-[var(--subtle)]">
+              No open balances — you{'’'}re all caught up.
+            </p>
+          ) : (
+            outstandingClients.map((client) => (
+              <div key={client.id} className="flex flex-col gap-2 rounded-md border border-[var(--line)] bg-[var(--bg)] p-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="min-w-0">
+                  <p className="font-medium">{client.name}</p>
+                  <p className="text-sm text-[var(--subtle)]">{formatMoney(ledgerByClient[client.id].outstanding)} outstanding</p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    className="icon-button px-3 py-2 text-xs"
+                    onClick={() => { setPaymentDraft((previous) => ({ ...previous, clientId: client.id })); setActiveNav('Payments'); }}
+                  >
+                    <CreditCard size={15} />
+                    Record payment
+                  </button>
+                  <button type="button" className="icon-button px-3 py-2 text-xs" onClick={() => setActiveNav('Statements')}>
+                    <MessageCircle size={15} />
+                    Send reminder
+                  </button>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </Panel>
+
+      {/* Quiet supporting metrics — glanceable, never competing with sessions. */}
+      <div className="rounded-md border border-[var(--line)] bg-[var(--panel)] px-4 py-3">
+        <p className="text-xs font-semibold uppercase tracking-wide text-[var(--subtle)]">Practice snapshot</p>
+        <div className="mt-2 flex flex-wrap items-baseline gap-x-6 gap-y-1 text-sm">
+          <span><span className="font-semibold">{stats.today}</span> <span className="text-[var(--subtle)]">session{stats.today === 1 ? '' : 's'} today</span></span>
+          <span><span className="font-semibold">{formatMoney(stats.outstanding)}</span> <span className="text-[var(--subtle)]">outstanding</span></span>
+          <span><span className="font-semibold">{formatMoney(stats.collected)}</span> <span className="text-[var(--subtle)]">collected this month</span></span>
+          <span><span className="font-semibold">{stats.lateCancels}</span> <span className="text-[var(--subtle)]">late cancellation{stats.lateCancels === 1 ? '' : 's'}</span></span>
+        </div>
+      </div>
 
       {modalSession && (
         <SessionModal
@@ -4374,7 +4365,7 @@ function StatementCard({ statement, client, settings, periodLabel, onCopy, onDow
   );
 }
 
-function Reports({ stats, exportJson }) {
+function Reports({ stats, trends, exportJson }) {
   const rows = [
     ['Sessions Scheduled', stats.sessionsScheduled],
     ['Sessions Attended', stats.sessionsAttended],
@@ -4387,21 +4378,25 @@ function Reports({ stats, exportJson }) {
     ['Late Cancellations', stats.lateCancels],
   ];
   return (
-    <Panel>
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h3 className="section-title">Monthly Overview</h3>
-          <p className="section-subtitle">June 2026 operating snapshot.</p>
+    <div className="space-y-5">
+      <Panel>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 className="section-title">Monthly Overview</h3>
+            <p className="section-subtitle">June 2026 operating snapshot.</p>
+          </div>
+          <button className="icon-button bg-[var(--primary)] text-white hover:bg-[var(--primary-dark)]" type="button" onClick={exportJson}>
+            <Download size={17} />
+            JSON Backup
+          </button>
         </div>
-        <button className="icon-button bg-[var(--primary)] text-white hover:bg-[var(--primary-dark)]" type="button" onClick={exportJson}>
-          <Download size={17} />
-          JSON Backup
-        </button>
-      </div>
-      <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-        {rows.map(([label, value]) => <MiniMetric key={label} label={label} value={value} />)}
-      </div>
-    </Panel>
+        <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {rows.map(([label, value]) => <MiniMetric key={label} label={label} value={value} />)}
+        </div>
+      </Panel>
+
+      {trends && trends.length > 0 && <TrendsPanel trends={trends} />}
+    </div>
   );
 }
 
