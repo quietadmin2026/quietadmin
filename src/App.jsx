@@ -3256,6 +3256,33 @@ function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessio
   const [editingClient, setEditingClient] = useState(null);
   const [editingCharge, setEditingCharge] = useState(null);
   const [importOpen, setImportOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const [sort, setSort] = useState('name-asc');
+
+  // Filter by name/email/phone/tag, then sort. "Recently added" uses the stored
+  // order (new clients are appended), shown newest-first.
+  const visibleClients = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const indexById = new Map(clients.map((client, index) => [client.id, index]));
+    const filtered = q
+      ? clients.filter((client) =>
+          [client.name, client.email, client.phone, ...(client.tags || [])]
+            .filter(Boolean)
+            .some((field) => String(field).toLowerCase().includes(q)),
+        )
+      : clients;
+    const sorted = [...filtered];
+    if (sort === 'name-desc') {
+      sorted.sort((a, b) => (b.name || '').localeCompare(a.name || ''));
+    } else if (sort === 'outstanding-desc') {
+      sorted.sort((a, b) => (ledgers[b.id]?.outstanding || 0) - (ledgers[a.id]?.outstanding || 0));
+    } else if (sort === 'recent') {
+      sorted.sort((a, b) => (indexById.get(b.id) ?? 0) - (indexById.get(a.id) ?? 0));
+    } else {
+      sorted.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+    }
+    return sorted;
+  }, [clients, search, sort, ledgers]);
 
   const selectedSessions = selectedClient ? sessions.filter((session) => session.clientId === selectedClient.id) : [];
   const selectedCharges = selectedClient ? charges.filter((charge) => charge.clientId === selectedClient.id) : [];
@@ -3291,23 +3318,57 @@ function Clients({ clients, selectedClient, setSelectedClientId, ledgers, sessio
             </button>
           </div>
         </div>
-        <div className="mt-4 space-y-2">
-          {clients.map((client) => (
-            <button
-              key={client.id}
-              type="button"
-              onClick={() => setSelectedClientId(client.id)}
-              className={`w-full rounded-md border p-3 text-left transition ${
-                selectedClient.id === client.id ? 'border-[var(--primary)] bg-[var(--accent-soft)]' : 'border-[var(--line)] bg-[var(--bg)] hover:bg-[var(--panel-muted)]'
-              }`}
-            >
-              <div className="flex items-center justify-between gap-3">
-                <span className="font-semibold">{client.name}</span>
-                <StatusBadge status={client.status} />
-              </div>
-              <p className="mt-1 text-sm text-[var(--subtle)]">{client.billingModel} - {client.collectionMethod}</p>
-            </button>
-          ))}
+        <div className="mt-4 flex flex-col gap-2 sm:flex-row">
+          <div className="flex flex-1 items-center gap-2 rounded-md border border-[var(--line)] bg-[var(--bg)] px-3 py-2">
+            <Search size={16} className="shrink-0 text-[var(--subtle)]" />
+            <input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Search name, email, phone or tag…"
+              className="w-full bg-transparent text-sm text-[var(--text)] outline-none placeholder:text-[var(--subtle)]"
+              aria-label="Search clients"
+            />
+            {search && (
+              <button type="button" className="shrink-0 text-[var(--subtle)] hover:text-[var(--text)]" onClick={() => setSearch('')} aria-label="Clear search">
+                <X size={15} />
+              </button>
+            )}
+          </div>
+          <select
+            value={sort}
+            onChange={(event) => setSort(event.target.value)}
+            aria-label="Sort clients"
+            className="rounded-md border border-[var(--line)] bg-[var(--bg)] px-3 py-2 text-sm text-[var(--text)] outline-none"
+          >
+            <option value="name-asc">Name A–Z</option>
+            <option value="name-desc">Name Z–A</option>
+            <option value="outstanding-desc">Outstanding (high–low)</option>
+            <option value="recent">Recently added</option>
+          </select>
+        </div>
+        <div className="mt-3 space-y-2">
+          {visibleClients.length === 0 ? (
+            <p className="rounded-md border border-[var(--line)] bg-[var(--bg)] px-3 py-4 text-center text-sm text-[var(--subtle)]">
+              {search ? `No clients match “${search}”.` : 'No clients yet.'}
+            </p>
+          ) : (
+            visibleClients.map((client) => (
+              <button
+                key={client.id}
+                type="button"
+                onClick={() => setSelectedClientId(client.id)}
+                className={`w-full rounded-md border p-3 text-left transition ${
+                  selectedClient && selectedClient.id === client.id ? 'border-[var(--primary)] bg-[var(--accent-soft)]' : 'border-[var(--line)] bg-[var(--bg)] hover:bg-[var(--panel-muted)]'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <span className="font-semibold">{client.name}</span>
+                  <StatusBadge status={client.status} />
+                </div>
+                <p className="mt-1 text-sm text-[var(--subtle)]">{client.billingModel} - {client.collectionMethod}</p>
+              </button>
+            ))
+          )}
         </div>
         <form className="mt-5 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4" onSubmit={addClient}>
           <h4 className="font-semibold">Add Client</h4>
