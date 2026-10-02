@@ -1259,6 +1259,28 @@ function allocateLedger(charges, payments) {
   return { byCharge, credit: Math.max(pool, 0) };
 }
 
+// Charges created by marking attendance; these should always be linked to the
+// session (or group-session attendance entry) that produced them. Subscription
+// Fee charges are intentionally unlinked and are never treated as orphans.
+const ATTENDANCE_CHARGE_REASONS = new Set(['Session Fee', 'Late Cancellation', 'Group Session']);
+
+// Ids of attendance charges that no session or group-session points at — the
+// duplicates left behind by the old re-mark bug. Returns [] when none.
+function findOrphanedChargeIds(charges, sessions, groupSessions) {
+  const referenced = new Set();
+  for (const session of sessions) {
+    if (session.chargeId) referenced.add(session.chargeId);
+  }
+  for (const gs of groupSessions) {
+    for (const entry of Object.values(gs.attendance || {})) {
+      if (entry && entry.chargeId) referenced.add(entry.chargeId);
+    }
+  }
+  return charges
+    .filter((charge) => ATTENDANCE_CHARGE_REASONS.has(charge.reason) && !referenced.has(charge.id))
+    .map((charge) => charge.id);
+}
+
 function timeToMinutes(time) {
   const [h, m] = String(time || '').split(':').map(Number);
   return (Number.isFinite(h) ? h : 0) * 60 + (Number.isFinite(m) ? m : 0);
@@ -1941,6 +1963,31 @@ function App() {
     showNotice('Fresh start from 1 Oct 2026 — earlier data cleared.');
   }
 
+  // One-off cleanup for duplicates left by the old re-mark bug: remove attendance
+  // charges that no session or group-session points at. Subscription charges are
+  // never touched. Shows the count and amount first and offers Undo.
+  function removeOrphanedCharges() {
+    const orphanIds = findOrphanedChargeIds(charges, sessions, groupSessions);
+    if (orphanIds.length === 0) {
+      showNotice('No orphaned charges found — nothing to clean up.');
+      return;
+    }
+    const orphanSet = new Set(orphanIds);
+    const removed = charges.filter((charge) => orphanSet.has(charge.id));
+    const total = removed.reduce((sum, charge) => sum + (Number(charge.amount) || 0), 0);
+    const count = orphanIds.length;
+    if (!window.confirm(
+      `Remove ${count} orphaned charge${count === 1 ? '' : 's'} totalling ${formatMoney(total)}?\n\n`
+      + 'These were left behind by duplicate attendance marks and aren’t linked to any session. '
+      + 'Removing them lowers the affected clients’ balances.',
+    )) return;
+    setCharges((current) => current.filter((charge) => !orphanSet.has(charge.id)));
+    showNotice(`Removed ${count} orphaned charge${count === 1 ? '' : 's'} (${formatMoney(total)}).`, {
+      label: 'Undo',
+      onClick: () => setCharges((current) => [...current, ...removed]),
+    });
+  }
+
   function exportJson() {
     const payload = { clients, groups, sessions, groupSessions, charges, payments, settings };
     downloadFile('quietadmin-backup.json', JSON.stringify(payload, null, 2), 'application/json');
@@ -2143,7 +2190,7 @@ function App() {
               />
             )}
 
-            {activeNav === 'Settings' && <SettingsScreen settings={settings} setSettings={setSettings} loadSampleData={loadSampleData} exportJson={exportJson} startFresh={startFreshFromOct1} drive={drive} onNotice={showNotice} />}
+            {activeNav === 'Settings' && <SettingsScreen settings={settings} setSettings={setSettings} loadSampleData={loadSampleData} exportJson={exportJson} startFresh={startFreshFromOct1} cleanupCharges={removeOrphanedCharges} drive={drive} onNotice={showNotice} />}
           </div>
         </section>
       </div>
@@ -4395,7 +4442,7 @@ function ImageUpload({ label, value, onChange, hint, maxDim, onError }) {
   );
 }
 
-function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, startFresh, drive, onNotice }) {
+function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, startFresh, cleanupCharges, drive, onNotice }) {
   const resetDone = settings.accountingStartMonth === ACCOUNTING_RESET_MONTH;
   return (
     <div className="grid gap-5 xl:grid-cols-2">
@@ -4459,6 +4506,18 @@ function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, sta
           </div>
         </div>
         <BackupManager drive={drive} onNotice={onNotice} />
+        <div className="mt-4 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
+          <p className="text-sm font-semibold">Clean up duplicate charges</p>
+          <p className="mt-1 text-sm text-[var(--subtle)]">
+            Removes attendance charges left behind by the old duplicate-marking bug — charges not linked to any session. Subscription charges are never touched.
+          </p>
+          <div className="mt-3">
+            <button className="icon-button" type="button" onClick={cleanupCharges}>
+              <Trash2 size={17} />
+              Remove orphaned charges
+            </button>
+          </div>
+        </div>
         <div className="mt-4 rounded-md border border-red-200 bg-red-50/60 p-4">
           <p className="text-sm font-semibold text-red-800">Start fresh from 1 Oct 2026</p>
           <p className="mt-1 text-sm text-[var(--subtle)]">
@@ -4852,6 +4911,7 @@ export {
   reconcileGroupSessions,
   reconcileSubscriptionCharges,
   allocateLedger,
+  findOrphanedChargeIds,
   computeMonthlyStatement,
   timeToMinutes,
   occupiesSlot,

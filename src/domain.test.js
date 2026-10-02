@@ -8,6 +8,7 @@ import {
   reconcileGroupSessions,
   reconcileSubscriptionCharges,
   allocateLedger,
+  findOrphanedChargeIds,
   computeMonthlyStatement,
   sessionsClash,
   findConflicts,
@@ -234,6 +235,37 @@ describe('computeMonthlyStatement', () => {
       paymentsTotal: 2500,
       broughtForward: 1500, // 2500 prior charge - 1000 prior payment
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findOrphanedChargeIds — cleanup for charges left by the old re-mark bug.
+// ---------------------------------------------------------------------------
+describe('findOrphanedChargeIds', () => {
+  const charges = [
+    { id: 'ch-linked', reason: 'Session Fee', amount: 2500 }, // linked to a session
+    { id: 'ch-orphan', reason: 'Session Fee', amount: 2500 }, // no session points here
+    { id: 'ch-grp', reason: 'Group Session', amount: 800 }, // linked via group attendance
+    { id: 'ch-grp-orphan', reason: 'Group Session', amount: 800 }, // group orphan
+    { id: 'sub-x', reason: 'Subscription Fee', amount: 4000 }, // intentionally unlinked
+  ];
+  const sessions = [{ id: 's1', chargeId: 'ch-linked' }, { id: 's2', chargeId: null }];
+  const groupSessions = [{ id: 'g1', attendance: { c1: { status: 'Present', chargeId: 'ch-grp' } } }];
+
+  it('returns only attendance charges no session or group points at', () => {
+    expect(findOrphanedChargeIds(charges, sessions, groupSessions).sort()).toEqual(['ch-grp-orphan', 'ch-orphan']);
+  });
+
+  it('never flags subscription charges even though they are unlinked', () => {
+    expect(findOrphanedChargeIds([{ id: 'sub-1', reason: 'Subscription Fee', amount: 4000 }], [], [])).toEqual([]);
+  });
+
+  it('returns [] when every attendance charge is linked', () => {
+    expect(findOrphanedChargeIds(
+      [{ id: 'ch-a', reason: 'Session Fee' }],
+      [{ id: 's', chargeId: 'ch-a' }],
+      [],
+    )).toEqual([]);
   });
 });
 
