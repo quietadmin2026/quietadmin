@@ -1,5 +1,56 @@
 import { describe, it, expect } from 'vitest';
-import { mergeValue } from './googleDrive.js';
+import { mergeValue, mergeThreeWay } from './googleDrive.js';
+
+const ids = (arr) => arr.map((r) => r.id).sort();
+
+describe('mergeThreeWay — array records honor deletions', () => {
+  it('keeps a locally deleted record deleted even though remote still has it', () => {
+    // The reported bug: delete locally, stale remote still has it -> must NOT return.
+    const base = [{ id: 'a' }, { id: 'b' }];
+    const local = [{ id: 'a' }]; // b deleted here
+    const remote = [{ id: 'a' }, { id: 'b' }]; // remote not yet updated
+    expect(ids(mergeThreeWay('charges', base, local, remote))).toEqual(['a']);
+  });
+
+  it('honors a remote deletion of a record we did not touch', () => {
+    const base = [{ id: 'a' }, { id: 'b' }];
+    const local = [{ id: 'a' }, { id: 'b' }];
+    const remote = [{ id: 'a' }]; // remote deleted b
+    expect(ids(mergeThreeWay('charges', base, local, remote))).toEqual(['a']);
+  });
+
+  it('keeps records added on either side', () => {
+    const base = [{ id: 'a' }];
+    const local = [{ id: 'a' }, { id: 'b' }]; // added locally
+    const remote = [{ id: 'a' }, { id: 'c' }]; // added remotely
+    expect(ids(mergeThreeWay('clients', base, local, remote))).toEqual(['a', 'b', 'c']);
+  });
+
+  it('lets a local edit win and keeps a remote edit when we did not touch it', () => {
+    const localEdit = mergeThreeWay('clients', [{ id: 'a', v: 1 }], [{ id: 'a', v: 2 }], [{ id: 'a', v: 1 }]);
+    expect(localEdit).toEqual([{ id: 'a', v: 2 }]);
+    const remoteEdit = mergeThreeWay('clients', [{ id: 'a', v: 1 }], [{ id: 'a', v: 1 }], [{ id: 'a', v: 2 }]);
+    expect(remoteEdit).toEqual([{ id: 'a', v: 2 }]);
+  });
+
+  it('keeps a local edit even when remote deleted that record', () => {
+    const out = mergeThreeWay('clients', [{ id: 'a', v: 1 }], [{ id: 'a', v: 2 }], []);
+    expect(out).toEqual([{ id: 'a', v: 2 }]);
+  });
+});
+
+describe('mergeThreeWay — settings', () => {
+  it('keeps each device’s own changed keys', () => {
+    const base = { currency: 'INR', language: 'en', therapistName: 'A' };
+    const local = { currency: 'USD', language: 'en', therapistName: 'A' }; // changed currency here
+    const remote = { currency: 'INR', language: 'es', therapistName: 'A' }; // changed language there
+    expect(mergeThreeWay('settings', base, local, remote)).toEqual({
+      currency: 'USD',
+      language: 'es',
+      therapistName: 'A',
+    });
+  });
+});
 
 describe('mergeValue — array records (union by id)', () => {
   it('keeps records added on either side', () => {

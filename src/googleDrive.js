@@ -213,6 +213,61 @@ export function mergeValue(key, base, overlay) {
   return { ...b, ...o };
 }
 
+const sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+// Three-way merge of one file when another device wrote it since our last sync.
+// `base` is that last-synced state (the common ancestor), `local` our current
+// data, `remote` what's on Drive now. Unlike a plain union, this honors
+// deletions: a record present in base and remote but gone from local was deleted
+// here and stays deleted (the fix for records reappearing after you delete them).
+// Rules per record id — added (not in base) is kept; deleted on one side (in base,
+// gone on that side, untouched on the other) is dropped; edited on one side wins;
+// edited on both keeps the local edit.
+export function mergeThreeWay(key, base, local, remote) {
+  if (EXPECTED_SHAPE[key] === 'array') {
+    const toMap = (arr) => new Map((Array.isArray(arr) ? arr : []).filter((r) => r && r.id != null).map((r) => [r.id, r]));
+    const baseById = toMap(base);
+    const localById = toMap(local);
+    const remoteById = toMap(remote);
+    const out = [];
+    for (const id of new Set([...localById.keys(), ...remoteById.keys()])) {
+      const inBase = baseById.has(id);
+      const l = localById.get(id);
+      const r = remoteById.get(id);
+      const hasL = localById.has(id);
+      const hasR = remoteById.has(id);
+      if (hasL && hasR) {
+        const localEdited = !inBase || !sameJson(l, baseById.get(id));
+        out.push(localEdited ? l : r); // our edit wins; otherwise take theirs
+      } else if (hasL) {
+        // remote no longer has it: kept if we added it or edited it, else it was
+        // deleted remotely and we honor that.
+        if (!inBase || !sameJson(l, baseById.get(id))) out.push(l);
+      } else {
+        // we no longer have it: kept only if the other device added it; if it was
+        // in base, we deleted it here and it stays deleted.
+        if (!inBase) out.push(r);
+      }
+    }
+    // Preserve any id-less items (shouldn't occur in this app's records).
+    for (const item of Array.isArray(local) ? local : []) if (!item || item.id == null) out.push(item);
+    return out;
+  }
+  // settings object: start from remote, then apply the keys this device changed,
+  // and honor keys this device removed.
+  const b = base && typeof base === 'object' && !Array.isArray(base) ? base : {};
+  const l = local && typeof local === 'object' && !Array.isArray(local) ? local : {};
+  const r = remote && typeof remote === 'object' && !Array.isArray(remote) ? remote : {};
+  const result = { ...r };
+  for (const k of Object.keys(l)) {
+    if (!sameJson(l[k], b[k])) result[k] = l[k];
+  }
+  for (const k of Object.keys(b)) {
+    if (!(k in l) && sameJson(b[k], r[k])) delete result[k];
+  }
+  return result;
+}
+
 async function findChildFolder(token, parentId, name) {
   const q = encodeURIComponent(
     `mimeType='application/vnd.google-apps.folder' and name='${name}' and '${parentId}' in parents and trashed=false`,
@@ -392,12 +447,14 @@ export function useGoogleDrive({ clientId, data, applyRemote, onConflict }) {
         if (!fileIds[key]) {
           const json = await createFile(token, folderId, name, effective[key]);
           fileIds[key] = json.id;
-          versions[key] = Number(json.version) || null;
+          // Read back the true version (see the push effect) so the first later
+          // write isn't mistaken for a conflict.
+          versions[key] = await getFileVersion(token, json.id);
         } else if (JSON.stringify(effective[key]) !== JSON.stringify(remote[key])) {
           // Drive is behind the merged result (file was missing/invalid, or we
           // merged in local-only edits) — write the merged data back up.
-          const v = await updateFile(token, fileIds[key], effective[key]);
-          versions[key] = v ?? versions[key];
+          await updateFile(token, fileIds[key], effective[key]);
+          versions[key] = await getFileVersion(token, fileIds[key]);
         }
       }
 
@@ -556,7 +613,10 @@ export function useGoogleDrive({ clientId, data, applyRemote, onConflict }) {
             if (!fileId) {
               const json = await createFile(token, folderRef.current, name, current[key]);
               fileIdsRef.current[key] = json.id;
-              versionRef.current[key] = Number(json.version) || null;
+              // A: read back the true version rather than trusting the upload
+              // response (the upload endpoint doesn't reliably return `version`,
+              // and a stale version makes the next push look like a conflict).
+              versionRef.current[key] = await getFileVersion(token, json.id);
               snapshotRef.current[key] = JSON.stringify(current[key]);
               continue;
             }
@@ -564,11 +624,13 @@ export function useGoogleDrive({ clientId, data, applyRemote, onConflict }) {
             const knownVersion = versionRef.current[key];
             if (knownVersion == null || remoteVersion == null || remoteVersion === knownVersion) {
               // No competing write since our last sync — safe to overwrite.
-              const v = await updateFile(token, fileId, current[key]);
-              versionRef.current[key] = v ?? remoteVersion;
+              await updateFile(token, fileId, current[key]);
+              versionRef.current[key] = await getFileVersion(token, fileId);
               snapshotRef.current[key] = JSON.stringify(current[key]);
             } else {
-              // Another device wrote this file — merge our change into theirs.
+              // B: another device wrote this file. Three-way merge against the
+              // last-synced snapshot so our deletions (and theirs) are honored
+              // instead of records being resurrected by a plain union.
               let remoteContent = null;
               try {
                 const c = await readFile(token, fileId);
@@ -576,9 +638,17 @@ export function useGoogleDrive({ clientId, data, applyRemote, onConflict }) {
               } catch {
                 // Unreadable remote — fall back to writing our own data.
               }
-              const mergedVal = remoteContent == null ? current[key] : mergeValue(key, remoteContent, current[key]);
-              const v = await updateFile(token, fileId, mergedVal);
-              versionRef.current[key] = v ?? remoteVersion;
+              let base = null;
+              try {
+                base = snapshotRef.current[key] != null ? JSON.parse(snapshotRef.current[key]) : null;
+              } catch {
+                base = null;
+              }
+              const mergedVal = remoteContent == null
+                ? current[key]
+                : mergeThreeWay(key, base, current[key], remoteContent);
+              await updateFile(token, fileId, mergedVal);
+              versionRef.current[key] = await getFileVersion(token, fileId);
               snapshotRef.current[key] = JSON.stringify(mergedVal);
               merges[key] = mergedVal;
             }
