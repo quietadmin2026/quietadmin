@@ -7,6 +7,7 @@ import {
   reconcileRecurringSessions,
   reconcileGroupSessions,
   reconcileSubscriptionCharges,
+  releaseSubscriptionTombstones,
   allocateLedger,
   findOrphanedChargeIds,
   computeMonthlyStatement,
@@ -116,6 +117,41 @@ describe('reconcileSubscriptionCharges', () => {
     const perSession = { id: 'c2', status: 'Active', billingModel: 'Per Session', sessionRate: 2500, joiningDate: '2026-06-01' };
     const archived = { ...sub, id: 'c3', status: 'Archived' };
     expect(reconcileSubscriptionCharges([perSession, archived], [], true, '2026-09-15')).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// releaseSubscriptionTombstones — lets deleted months re-bill after a fee change
+// (Bug: outstanding read as 0 after converting a client and changing their fee).
+// ---------------------------------------------------------------------------
+describe('releaseSubscriptionTombstones', () => {
+  it('drops only the given client’s subscription tombstones', () => {
+    const tombstones = ['sub-c1-2026-08', 'sub-c1-2026-09', 'sub-c2-2026-08'];
+    expect(releaseSubscriptionTombstones(tombstones, 'c1')).toEqual(['sub-c2-2026-08']);
+  });
+
+  it('returns an equal-length array when the client has no tombstones', () => {
+    const tombstones = ['sub-c2-2026-08'];
+    const out = releaseSubscriptionTombstones(tombstones, 'c1');
+    expect(out).toEqual(tombstones);
+    expect(out.length).toBe(tombstones.length);
+  });
+
+  it('lets a deleted month regenerate at the new fee once released', () => {
+    const sub = { id: 'c1', status: 'Active', billingModel: 'Subscription', monthlyFee: 5000, joiningDate: '2026-08-01' };
+    const tombstones = ['sub-c1-2026-08', 'sub-c1-2026-09'];
+    // Before release: the deleted months stay suppressed.
+    const suppressed = reconcileSubscriptionCharges([sub], [], true, '2026-09-15', '2026-08', tombstones);
+    expect(suppressed).toEqual([]);
+    // After release: both months come back at the new 5000 fee.
+    const released = releaseSubscriptionTombstones(tombstones, 'c1');
+    const rebilled = reconcileSubscriptionCharges([sub], [], true, '2026-09-15', '2026-08', released);
+    expect(rebilled.map((c) => c.id)).toEqual(['sub-c1-2026-08', 'sub-c1-2026-09']);
+    expect(rebilled.every((c) => c.amount === 5000)).toBe(true);
+  });
+
+  it('tolerates an undefined tombstone list', () => {
+    expect(releaseSubscriptionTombstones(undefined, 'c1')).toEqual([]);
   });
 });
 

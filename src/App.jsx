@@ -1206,6 +1206,18 @@ function reconcileSubscriptionCharges(clients, charges, autoCreate, today, accou
   return charges.concat(additions);
 }
 
+// Drop one client's subscription deletion tombstones so reconcile may re-bill
+// those months again — used when their monthly fee changes, since a fee change
+// means "re-bill at the new rate", not "keep these permanently deleted".
+// Returns the same array reference when nothing changed so callers can skip a
+// needless state update.
+function releaseSubscriptionTombstones(tombstones, clientId) {
+  const list = tombstones || [];
+  const prefix = `sub-${clientId}-`;
+  const kept = list.filter((id) => !String(id).startsWith(prefix));
+  return kept.length === list.length ? list : kept;
+}
+
 const CHARGE_STATUS_TONE = {
   Paid: 'border-[#bcdcd0] bg-[var(--positive-soft)] text-[#246454]',
   'Partially Paid': 'border-amber-300 bg-amber-50 text-amber-700',
@@ -1702,7 +1714,21 @@ function App() {
   }
 
   function updateClient(next) {
+    const prev = clients.find((client) => client.id === next.id);
     setClients((current) => current.map((client) => (client.id === next.id ? next : client)));
+    // When a subscription client's monthly fee changes, release that client's
+    // deletion tombstones so any months they deleted can re-bill at the new fee.
+    // Without this, reconcileSubscriptionCharges would permanently suppress those
+    // ids and the client's outstanding could read as 0 after a fee change.
+    if (prev && Number(prev.monthlyFee || 0) !== Number(next.monthlyFee || 0)) {
+      setSettings((current) => {
+        const existing = current.deletedSubscriptionCharges || [];
+        const kept = releaseSubscriptionTombstones(existing, next.id);
+        return kept.length === existing.length
+          ? current
+          : { ...current, deletedSubscriptionCharges: kept };
+      });
+    }
     showNotice(`${next.name} updated.`);
   }
 
@@ -4948,6 +4974,7 @@ export {
   reconcileRecurringSessions,
   reconcileGroupSessions,
   reconcileSubscriptionCharges,
+  releaseSubscriptionTombstones,
   allocateLedger,
   findOrphanedChargeIds,
   computeMonthlyStatement,
