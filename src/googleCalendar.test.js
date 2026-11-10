@@ -6,6 +6,7 @@ import {
   buildEventBody,
   desiredCalendarEvents,
   diffCalendar,
+  mergeEventIndex,
 } from './googleCalendar.js';
 
 describe('clientInitials', () => {
@@ -127,5 +128,26 @@ describe('diffCalendar', () => {
     expect(work.deletes.map((d) => [d.id, d.eventId])).toEqual([['s9', 'e9']]);
     expect(work.creates).toEqual([]);
     expect(work.updates).toEqual([]);
+  });
+});
+
+describe('mergeEventIndex — cross-device duplicate prevention', () => {
+  it('adopts entries from another device that this one lacks', () => {
+    const fromDrive = { s1: { eventId: 'e1', sig: 'a' } };
+    const local = {};
+    // After merging, s1 is known locally, so a later diff UPDATEs e1 instead of
+    // creating a second event for the same session.
+    expect(mergeEventIndex(fromDrive, local)).toEqual({ s1: { eventId: 'e1', sig: 'a' } });
+  });
+
+  it('keeps the local entry when both sides have the same session', () => {
+    const fromDrive = { s1: { eventId: 'e1', sig: 'old' } };
+    const local = { s1: { eventId: 'e1', sig: 'new' } };
+    expect(mergeEventIndex(fromDrive, local).s1.sig).toBe('new');
+  });
+
+  it('tolerates missing sides', () => {
+    expect(mergeEventIndex(undefined, { s1: 1 })).toEqual({ s1: 1 });
+    expect(mergeEventIndex({ s2: 2 }, undefined)).toEqual({ s2: 2 });
   });
 });

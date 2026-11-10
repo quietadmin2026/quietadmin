@@ -147,6 +147,14 @@ export function diffCalendar(desired, keep, index) {
   return { creates, updates, deletes };
 }
 
+// Union two event indexes (sessionId -> { eventId, sig }). Local entries win on a
+// clash; config-only entries are adopted. Used so a second device that received
+// the index through Drive sync updates the first device's events instead of
+// creating duplicates.
+export function mergeEventIndex(configIndex, localIndex) {
+  return { ...(configIndex || {}), ...(localIndex || {}) };
+}
+
 // ---------------------------------------------------------------------------
 // Network layer (thin; not unit-tested).
 // ---------------------------------------------------------------------------
@@ -243,6 +251,7 @@ export function useGoogleCalendar({ clientId, config, sessions, groupSessions, c
   const [status, setStatus] = useState('idle'); // idle | connecting | connected | syncing | error
   const [error, setError] = useState('');
   const [lastSyncedAt, setLastSyncedAt] = useState(null);
+  const [retryTick, setRetryTick] = useState(0);
 
   const tokenRef = useRef(null);
   const calendarIdRef = useRef(config?.calendarId || '');
@@ -250,6 +259,12 @@ export function useGoogleCalendar({ clientId, config, sessions, groupSessions, c
   const runningRef = useRef(false);
   const onConfigRef = useRef(onConfigChange);
   onConfigRef.current = onConfigChange;
+  // Latest config/status for closures that must not go stale (the index and
+  // calendarId arrive from other devices via Drive sync; status gates retries).
+  const configRef = useRef(config);
+  configRef.current = config;
+  const statusRef = useRef(status);
+  statusRef.current = status;
 
   const timeZone = useMemo(() => {
     try {
@@ -357,6 +372,12 @@ export function useGoogleCalendar({ clientId, config, sessions, groupSessions, c
       if (runningRef.current) return;
       runningRef.current = true;
       try {
+        // Adopt a calendarId / event ids another device created and synced here
+        // via Drive, so we update their events rather than making duplicates.
+        const cfg = configRef.current || {};
+        if (!calendarIdRef.current && cfg.calendarId) calendarIdRef.current = cfg.calendarId;
+        indexRef.current = mergeEventIndex(cfg.eventIndex, indexRef.current);
+
         const { events, keep } = desiredCalendarEvents(
           { sessions, groupSessions, clients, groups },
           { namingMode, floorIso, timeZone },
@@ -407,9 +428,28 @@ export function useGoogleCalendar({ clientId, config, sessions, groupSessions, c
     }, 1500);
     return () => window.clearTimeout(handle);
     // desiredSignature captures the session data that matters; the arrays are read
-    // fresh inside the timer.
+    // fresh inside the timer. retryTick lets a recovered connection re-run a sync
+    // that previously failed, without a session edit.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [desiredSignature, enabled, clientId, withFreshToken, ensureCalendar]);
+  }, [desiredSignature, enabled, clientId, retryTick, withFreshToken, ensureCalendar]);
+
+  // Self-healing: a sync can fail on a transient network/token blip. Retry when
+  // the window regains focus, when the browser comes back online, and on a slow
+  // timer — but only while we're actually in an error state.
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const retry = () => {
+      if (statusRef.current === 'error') setRetryTick((t) => t + 1);
+    };
+    window.addEventListener('focus', retry);
+    window.addEventListener('online', retry);
+    const id = window.setInterval(retry, 60000);
+    return () => {
+      window.removeEventListener('focus', retry);
+      window.removeEventListener('online', retry);
+      window.clearInterval(id);
+    };
+  }, [enabled]);
 
   return {
     status,

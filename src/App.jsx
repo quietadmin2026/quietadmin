@@ -2094,7 +2094,7 @@ function App() {
         <section className="min-w-0 flex-1">
           <MobileNav activeNav={activeNav} setActiveNav={setActiveNav} />
           <div className="mx-auto max-w-7xl px-4 py-5 sm:px-6 lg:px-8">
-            <TopBar settings={settings} drive={drive} signOut={signOut} today={today} />
+            <TopBar settings={settings} drive={drive} calendar={calendar} signOut={signOut} today={today} />
 
             {activeNav === 'Dashboard' && (
               <Dashboard
@@ -2544,7 +2544,7 @@ function Brand() {
   );
 }
 
-function TopBar({ settings, drive, signOut, today }) {
+function TopBar({ settings, drive, calendar, signOut, today }) {
   const currentDate = toDate(today).toLocaleDateString(localeForLanguage(), { weekday: 'long', month: 'long', day: 'numeric' });
   return (
     <header className="mb-5 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
@@ -2556,6 +2556,7 @@ function TopBar({ settings, drive, signOut, today }) {
       <div className="flex flex-col items-stretch gap-2 md:items-end">
         <div className="flex flex-wrap gap-2">
           <DriveButton drive={drive} />
+          {calendar?.enabled && <CalendarBadge calendar={calendar} />}
           {drive.signedIn && (
             <button className="icon-button" type="button" onClick={signOut}>
               <LogOut size={17} />
@@ -2599,6 +2600,38 @@ function DriveButton({ drive }) {
       <CloudOff size={17} />
       {t('drive.signIn')}
     </button>
+  );
+}
+
+// Compact calendar-sync status beside the Drive status, shown only once the
+// therapist has turned calendar sync on.
+function CalendarBadge({ calendar }) {
+  const { status, lastSyncedAt, error } = calendar;
+  const base = 'inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm font-medium';
+  if (status === 'connecting' || status === 'syncing') {
+    return (
+      <span className={`${base} border-[var(--line)] bg-[var(--accent-soft)] text-[var(--primary-dark)]`}>
+        <CalendarDays size={17} />
+        Calendar syncing…
+      </span>
+    );
+  }
+  if (status === 'error') {
+    return (
+      <span className={`${base} border-red-200 bg-red-50 text-red-700`} title={error || ''}>
+        <CalendarDays size={17} />
+        Calendar sync issue
+      </span>
+    );
+  }
+  const label = lastSyncedAt
+    ? `Calendar · ${new Date(lastSyncedAt).toLocaleTimeString(localeForLanguage(), { hour: '2-digit', minute: '2-digit' })}`
+    : 'Calendar on';
+  return (
+    <span className={`${base} border-[var(--line)] bg-[var(--accent-soft)] text-[var(--primary-dark)]`}>
+      <CalendarDays size={17} />
+      {label}
+    </span>
   );
 }
 
