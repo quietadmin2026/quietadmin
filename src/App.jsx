@@ -36,6 +36,7 @@ import {
   Copy,
 } from 'lucide-react';
 import { useGoogleDrive } from './googleDrive.js';
+import { useGoogleCalendar, NAMING_MODES } from './googleCalendar.js';
 import { LANGUAGES, setActiveLanguage, localeForLanguage, t } from './i18n.js';
 
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || '';
@@ -131,6 +132,11 @@ const initialSettings = {
   // Deterministic ids of subscription charges the therapist deleted on purpose,
   // so reconcile doesn't recreate them. See deleteCharge / reconcileSubscriptionCharges.
   deletedSubscriptionCharges: [],
+  // Google Calendar sync (Phase 1). Off until the therapist connects it. The app
+  // owns a dedicated "QuietAdmin — Sessions" calendar and pushes sessions onto it;
+  // eventIndex maps sessionId -> { eventId, sig } and rides Drive sync so event
+  // ids are shared across devices. See googleCalendar.js.
+  calendar: { enabled: false, namingMode: 'initials', calendarId: '', eventIndex: {} },
   profileComplete: false,
 };
 
@@ -1388,6 +1394,22 @@ function App() {
 
   const drive = useGoogleDrive({ clientId: GOOGLE_CLIENT_ID, data: driveData, applyRemote, onConflict: onDriveConflict });
 
+  // Google Calendar sync. Merges a patch into settings.calendar (persisted and
+  // Drive-synced like everything else). Functional update avoids stale closures.
+  const onCalendarConfigChange = useCallback((patch) => {
+    setSettings((current) => ({ ...current, calendar: { ...(current.calendar || {}), ...patch } }));
+  }, [setSettings]);
+  const calendar = useGoogleCalendar({
+    clientId: GOOGLE_CLIENT_ID,
+    config: settings.calendar,
+    sessions,
+    groupSessions,
+    clients,
+    groups,
+    today,
+    onConfigChange: onCalendarConfigChange,
+  });
+
   // Returning, already-set-up user: refresh the session in the background so the
   // app opens instantly from cache and syncs when silent auth succeeds.
   useEffect(() => {
@@ -2206,7 +2228,7 @@ function App() {
               />
             )}
 
-            {activeNav === 'Settings' && <SettingsScreen settings={settings} setSettings={setSettings} loadSampleData={loadSampleData} exportJson={exportJson} startFresh={startFreshFromOct1} cleanupCharges={removeOrphanedCharges} drive={drive} onNotice={showNotice} />}
+            {activeNav === 'Settings' && <SettingsScreen settings={settings} setSettings={setSettings} loadSampleData={loadSampleData} exportJson={exportJson} startFresh={startFreshFromOct1} cleanupCharges={removeOrphanedCharges} drive={drive} calendar={calendar} onNotice={showNotice} />}
           </div>
         </section>
       </div>
@@ -4522,7 +4544,7 @@ function ImageUpload({ label, value, onChange, hint, maxDim, onError }) {
   );
 }
 
-function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, startFresh, cleanupCharges, drive, onNotice }) {
+function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, startFresh, cleanupCharges, drive, calendar, onNotice }) {
   const resetDone = settings.accountingStartMonth === ACCOUNTING_RESET_MONTH;
   return (
     <div className="grid gap-5 xl:grid-cols-2">
@@ -4586,6 +4608,7 @@ function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, sta
           </div>
         </div>
         <BackupManager drive={drive} onNotice={onNotice} />
+        <CalendarSync calendar={calendar} settings={settings} setSettings={setSettings} />
         <div className="mt-4 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
           <p className="text-sm font-semibold">Clean up duplicate charges</p>
           <p className="mt-1 text-sm text-[var(--subtle)]">
@@ -4626,6 +4649,61 @@ function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, sta
           <ReminderTemplateEditor settings={settings} setSettings={setSettings} />
         </div>
       </Panel>
+    </div>
+  );
+}
+
+function CalendarSync({ calendar, settings, setSettings }) {
+  const config = settings.calendar || {};
+  const namingMode = NAMING_MODES.includes(config.namingMode) ? config.namingMode : 'initials';
+  const busy = calendar.status === 'connecting' || calendar.status === 'syncing';
+  const statusLabel =
+    calendar.status === 'connecting' ? 'Connecting…'
+    : calendar.status === 'syncing' ? 'Syncing…'
+    : calendar.lastSyncedAt ? `Last synced ${formatBackupTime(calendar.lastSyncedAt)}`
+    : 'Connected — changes sync automatically.';
+
+  return (
+    <div className="mt-4 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
+      <div className="flex items-center gap-2">
+        <CalendarDays size={17} className="text-[var(--primary)]" />
+        <p className="text-sm font-semibold">Google Calendar</p>
+      </div>
+      <p className="mt-1 text-sm text-[var(--subtle)]">
+        Pushes your sessions to a private “{calendar.calendarName}” calendar in Google. The app creates and manages
+        only that calendar — it never reads your personal events. Make changes here in the app and they flow to Google.
+      </p>
+
+      {!calendar.configured ? (
+        <p className="mt-3 text-xs text-[var(--accent)]">Google sign-in isn’t configured (missing VITE_GOOGLE_CLIENT_ID).</p>
+      ) : !calendar.enabled ? (
+        <div className="mt-3">
+          <button className="icon-button" type="button" onClick={() => calendar.connect()} disabled={busy}>
+            <CalendarDays size={17} />
+            {calendar.status === 'connecting' ? 'Connecting…' : 'Connect Google Calendar'}
+          </button>
+        </div>
+      ) : (
+        <div className="mt-3 grid gap-3">
+          <p className="text-xs text-[var(--subtle)]">{statusLabel}</p>
+          <Select
+            label="How clients appear on events"
+            value={namingMode}
+            options={NAMING_MODES}
+            labels={{ initials: 'Initials only (A.R.)', generic: 'Generic (“Session”)', name: 'Full client name' }}
+            onChange={(value) => setSettings({ ...settings, calendar: { ...config, namingMode: value } })}
+          />
+          <p className="-mt-1 text-xs text-[var(--subtle)]">
+            Events are marked private. For confidentiality, initials or a generic label are recommended over full names.
+          </p>
+          <div>
+            <button className="icon-button" type="button" onClick={() => calendar.disconnect()}>
+              Stop syncing
+            </button>
+          </div>
+        </div>
+      )}
+      {calendar.error && <p className="mt-2 text-xs text-[var(--accent)]">{calendar.error}</p>}
     </div>
   );
 }

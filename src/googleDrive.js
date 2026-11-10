@@ -39,7 +39,7 @@ function hasExpectedShape(key, value) {
 
 let gisPromise = null;
 
-function loadGisScript() {
+export function loadGisScript() {
   if (gisPromise) return gisPromise;
   gisPromise = new Promise((resolve, reject) => {
     if (window.google?.accounts?.oauth2) {
