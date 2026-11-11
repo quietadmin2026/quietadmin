@@ -37,6 +37,8 @@ import {
 } from 'lucide-react';
 import { useGoogleDrive } from './googleDrive.js';
 import { useGoogleCalendar, NAMING_MODES } from './googleCalendar.js';
+import { useSupabaseAuth } from './useSupabaseAuth.js';
+import { useSupabaseData } from './useSupabaseData.js';
 import { LANGUAGES, setActiveLanguage, localeForLanguage, t } from './i18n.js';
 
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || '';
@@ -1394,6 +1396,18 @@ function App() {
 
   const drive = useGoogleDrive({ clientId: GOOGLE_CLIENT_ID, data: driveData, applyRemote, onConflict: onDriveConflict });
 
+  // Supabase Google auth (WS1). Additive: when configured, a Supabase session
+  // counts as signed in; when not, the app falls back to the Drive flow.
+  const supaAuth = useSupabaseAuth();
+  const supaSignedIn = supaAuth.configured && Boolean(supaAuth.user);
+
+  // WS2: when signed in via Supabase, load/save the practice data through Supabase
+  // (document tables, RLS-scoped). Inert until a Supabase session exists, so the
+  // Drive/localStorage path is untouched for everyone else. Drive stays idle in
+  // this mode (it only syncs after an explicit drive.connect), so the two don't
+  // fight over the same state.
+  const supaData = useSupabaseData({ user: supaAuth.user, data: driveData, applyRemote });
+
   // Google Calendar sync. Merges a patch into settings.calendar (persisted and
   // Drive-synced like everything else). Functional update avoids stale closures.
   const onCalendarConfigChange = useCallback((patch) => {
@@ -1957,8 +1971,9 @@ function App() {
   }
 
   function signOut() {
-    if (!window.confirm('Sign out? Your data stays safe in Google Drive. This device will sign in again to reload it.')) return;
+    if (!window.confirm('Sign out? Your data stays safe. This device will sign in again to reload it.')) return;
     drive.disconnect();
+    if (supaAuth.configured) supaAuth.signOut();
     STORAGE_KEYS.forEach((key) => {
       try {
         window.localStorage.removeItem(`${STORAGE_PREFIX}${key}`);
@@ -2054,13 +2069,13 @@ function App() {
   setActiveCurrency(settings.currency);
   setActiveLanguage(settings.language);
 
-  const gate = settings.profileComplete ? 'app' : drive.signedIn ? 'setup' : 'signin';
+  const gate = settings.profileComplete ? 'app' : (drive.signedIn || supaSignedIn) ? 'setup' : 'signin';
 
   if (gate !== 'app') {
     return (
       <main className="min-h-screen bg-[var(--bg)] text-[var(--text)]">
         {gate === 'signin' ? (
-          <SignInScreen drive={drive} />
+          <SignInScreen drive={drive} supaAuth={supaAuth} />
         ) : (
           <SetupScreen drive={drive} onComplete={completeSetup} />
         )}
@@ -2236,8 +2251,10 @@ function App() {
   );
 }
 
-function SignInScreen({ drive }) {
-  const busy = drive.status === 'connecting' || drive.status === 'syncing';
+function SignInScreen({ drive, supaAuth }) {
+  const driveBusy = drive.status === 'connecting' || drive.status === 'syncing';
+  // Prefer Supabase auth when it's configured; otherwise the legacy Drive flow.
+  const useSupa = supaAuth?.configured;
   return (
     <div className="flex min-h-screen items-center justify-center p-4">
       <div className="w-full max-w-md rounded-lg border border-[var(--line)] bg-[var(--panel)] p-6 text-center shadow-soft sm:p-8">
@@ -2247,21 +2264,34 @@ function SignInScreen({ drive }) {
         <h1 className="mt-4 text-2xl font-semibold">QuietAdmin</h1>
         <p className="mt-1 text-sm text-[var(--subtle)]">The admin assistant for therapists.</p>
         <p className="mt-5 text-sm text-[var(--subtle)]">
-          Sign in with Google to manage your practice. Your data is stored privately in your own Google Drive.
+          Sign in with Google to manage your practice. Your account and data are private to you.
         </p>
-        <button
-          type="button"
-          className="mt-6 icon-button w-full justify-center bg-[var(--primary)] text-white hover:bg-[var(--primary-dark)] disabled:opacity-50"
-          onClick={drive.connect}
-          disabled={busy || !drive.configured}
-        >
-          <Mail size={18} />
-          {busy ? 'Signing in…' : 'Sign in with Google'}
-        </button>
-        {!drive.configured && (
+        {useSupa ? (
+          <button
+            type="button"
+            className="mt-6 icon-button w-full justify-center bg-[var(--primary)] text-white hover:bg-[var(--primary-dark)] disabled:opacity-50"
+            onClick={supaAuth.signIn}
+            disabled={supaAuth.loading}
+          >
+            <Mail size={18} />
+            {supaAuth.loading ? 'Loading…' : 'Sign in with Google'}
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="mt-6 icon-button w-full justify-center bg-[var(--primary)] text-white hover:bg-[var(--primary-dark)] disabled:opacity-50"
+            onClick={drive.connect}
+            disabled={driveBusy || !drive.configured}
+          >
+            <Mail size={18} />
+            {driveBusy ? 'Signing in…' : 'Sign in with Google'}
+          </button>
+        )}
+        {!useSupa && !drive.configured && (
           <p className="mt-3 text-xs text-[var(--accent)]">Google sign-in isn’t configured (missing VITE_GOOGLE_CLIENT_ID).</p>
         )}
-        {drive.error && <p className="mt-3 text-xs text-[var(--accent)]">{drive.error}</p>}
+        {useSupa && supaAuth.error && <p className="mt-3 text-xs text-[var(--accent)]">{supaAuth.error}</p>}
+        {!useSupa && drive.error && <p className="mt-3 text-xs text-[var(--accent)]">{drive.error}</p>}
       </div>
     </div>
   );
