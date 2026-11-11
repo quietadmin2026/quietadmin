@@ -1427,6 +1427,9 @@ function App() {
   // Returning, already-set-up user: refresh the session in the background so the
   // app opens instantly from cache and syncs when silent auth succeeds.
   useEffect(() => {
+    // In Supabase mode, Supabase is the backend — don't attempt Drive silent auth
+    // (it only produces blocked-popup noise and isn't the source of truth).
+    if (supaAuth.configured) return;
     if (settings.profileComplete && drive.configured) drive.trySilent();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -2069,6 +2072,21 @@ function App() {
   setActiveCurrency(settings.currency);
   setActiveLanguage(settings.language);
 
+  // While a Supabase session is loading its account, don't render the app with
+  // whatever is cached locally — it could be a previous user's data. Show a
+  // loading screen until the account's own data has been applied.
+  const supaLoading = supaSignedIn && (supaData.status === 'idle' || supaData.status === 'loading');
+  if (supaLoading) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-[var(--bg)] text-[var(--text)]">
+        <div className="flex items-center gap-3 text-[var(--subtle)]">
+          <RefreshCcw size={18} className="animate-spin" />
+          <span className="text-sm">Loading your practice…</span>
+        </div>
+      </main>
+    );
+  }
+
   const gate = settings.profileComplete ? 'app' : (drive.signedIn || supaSignedIn) ? 'setup' : 'signin';
 
   if (gate !== 'app') {
@@ -2243,7 +2261,7 @@ function App() {
               />
             )}
 
-            {activeNav === 'Settings' && <SettingsScreen settings={settings} setSettings={setSettings} loadSampleData={loadSampleData} exportJson={exportJson} startFresh={startFreshFromOct1} cleanupCharges={removeOrphanedCharges} drive={drive} calendar={calendar} onNotice={showNotice} />}
+            {activeNav === 'Settings' && <SettingsScreen settings={settings} setSettings={setSettings} loadSampleData={loadSampleData} exportJson={exportJson} startFresh={startFreshFromOct1} cleanupCharges={removeOrphanedCharges} drive={drive} calendar={calendar} supaMode={supaAuth.configured} onNotice={showNotice} />}
           </div>
         </section>
       </div>
@@ -4607,7 +4625,7 @@ function ImageUpload({ label, value, onChange, hint, maxDim, onError }) {
   );
 }
 
-function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, startFresh, cleanupCharges, drive, calendar, onNotice }) {
+function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, startFresh, cleanupCharges, drive, calendar, supaMode, onNotice }) {
   const resetDone = settings.accountingStartMonth === ACCOUNTING_RESET_MONTH;
   return (
     <div className="space-y-5">
@@ -4696,7 +4714,7 @@ function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, sta
             </div>
           </div>
           <CalendarSync calendar={calendar} settings={settings} setSettings={setSettings} />
-          <BackupManager drive={drive} onNotice={onNotice} />
+          {!supaMode && <BackupManager drive={drive} onNotice={onNotice} />}
           <div className="rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
             <p className="text-sm font-semibold">Clean up duplicate charges</p>
             <p className="mt-1 text-sm text-[var(--subtle)]">

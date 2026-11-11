@@ -54,10 +54,13 @@ export function useSupabaseData({ user, data, applyRemote }) {
           applyRemote(effective);
           snapshotRef.current = bundleOf({ ...dataRef.current, ...effective });
         } else {
-          // Empty account: seed it from current local state.
-          const local = bundleOf(dataRef.current);
-          await pushAll(user.id, {}, local);
-          snapshotRef.current = local;
+          // Brand-new account: start CLEAN. Never inherit whatever is cached in
+          // this browser — it may belong to a previous user on a shared device,
+          // or be sample data. Reset to empty + default settings (profile_complete
+          // false) so the therapist goes through onboarding, then it persists.
+          const empty = { settings: {}, clients: [], groups: [], sessions: [], groupSessions: [], charges: [], payments: [] };
+          applyRemote(empty);
+          snapshotRef.current = { settings: null, clients: [], groups: [], sessions: [], groupSessions: [], charges: [], payments: [] };
         }
         readyRef.current = true;
         setStatus('ready');
