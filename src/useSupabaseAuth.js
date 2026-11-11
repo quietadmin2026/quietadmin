@@ -27,6 +27,21 @@ export function useSupabaseAuth() {
     const { data: sub } = supabase.auth.onAuthStateChange((_event, next) => {
       setSession(next);
       setUser(next?.user ?? null);
+      // Right after Google OAuth, the session carries a provider refresh token
+      // (because we requested offline access). Hand it to secure server-side
+      // storage via the RPC so a future Edge Function can refresh the Google
+      // access token and sync the calendar in the background. The browser never
+      // touches the google_credentials table directly.
+      if (next?.provider_refresh_token) {
+        supabase
+          .rpc('upsert_google_credentials', {
+            p_refresh_token: next.provider_refresh_token,
+            p_scopes: 'https://www.googleapis.com/auth/calendar.app.created',
+          })
+          .then(({ error: rpcError }) => {
+            if (rpcError) console.warn('store google credentials failed:', rpcError.message);
+          });
+      }
     });
     return () => {
       active = false;
