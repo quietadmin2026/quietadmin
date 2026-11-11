@@ -4610,80 +4610,111 @@ function ImageUpload({ label, value, onChange, hint, maxDim, onError }) {
 function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, startFresh, cleanupCharges, drive, calendar, onNotice }) {
   const resetDone = settings.accountingStartMonth === ACCOUNTING_RESET_MONTH;
   return (
-    <div className="grid gap-5 xl:grid-cols-2">
+    <div className="space-y-5">
+      <div className="grid gap-5 xl:grid-cols-2">
+        {/* Profile & branding */}
+        <Panel>
+          <h3 className="section-title">Profile &amp; branding</h3>
+          <p className="mt-1 text-sm text-[var(--subtle)]">Your details and the look of statements you send.</p>
+          <div className="mt-4 grid gap-3">
+            <Input label="Therapist Name" value={settings.therapistName} onChange={(value) => setSettings({ ...settings, therapistName: value })} />
+            <Input label="Practice Name" value={settings.practiceName} onChange={(value) => setSettings({ ...settings, practiceName: value })} />
+            <Input label="Payment Details (UPI / bank)" value={settings.paymentDetails || ''} onChange={(value) => setSettings({ ...settings, paymentDetails: value })} />
+            <Select label="Currency" value={settings.currency || 'INR'} options={CURRENCY_OPTIONS} onChange={(value) => setSettings({ ...settings, currency: value })} />
+            <Select
+              label={t('settings.language')}
+              value={settings.language || 'en'}
+              options={LANGUAGES.map(([code]) => code)}
+              labels={Object.fromEntries(LANGUAGES)}
+              onChange={(value) => setSettings({ ...settings, language: value })}
+            />
+          </div>
+          <div className="mt-5 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
+            <p className="text-sm font-semibold">Branding</p>
+            <p className="mt-1 text-sm text-[var(--subtle)]">Shown on statements and invoices you share or download.</p>
+            <div className="mt-3 grid gap-4">
+              <ImageUpload
+                label="Practice logo"
+                value={settings.logo || ''}
+                onChange={(value) => setSettings({ ...settings, logo: value })}
+                onError={onNotice}
+                maxDim={320}
+                hint="Appears at the top of each statement. PNG or JPG."
+              />
+              <ImageUpload
+                label="Signature"
+                value={settings.signatureImage || ''}
+                onChange={(value) => setSettings({ ...settings, signatureImage: value })}
+                onError={onNotice}
+                maxDim={400}
+                hint="A scan or image of your signature, shown above your name."
+              />
+              <Input
+                label="Signature name"
+                value={settings.signatureName || ''}
+                onChange={(value) => setSettings({ ...settings, signatureName: value })}
+              />
+              <p className="-mt-2 text-xs text-[var(--subtle)]">Defaults to your therapist name if left blank.</p>
+            </div>
+          </div>
+        </Panel>
+
+        {/* Billing & reminders */}
+        <Panel>
+          <h3 className="section-title">Billing &amp; reminders</h3>
+          <p className="mt-1 text-sm text-[var(--subtle)]">How charges, cancellations and reminders behave.</p>
+          <div className="mt-4 grid gap-4">
+            <Toggle label="Auto Create Charges" checked={settings.autoCreateCharges} onChange={(checked) => setSettings({ ...settings, autoCreateCharges: checked })} />
+            <Select label="Late Cancellation Threshold" value={String(settings.lateCancellationHours)} options={['12', '24', '48']} labels={{ 12: '12 Hours', 24: '24 Hours', 48: '48 Hours' }} onChange={(value) => setSettings({ ...settings, lateCancellationHours: Number(value) })} />
+            <Select label="Late Cancellation Charge" value={String(settings.lateCancellationCharge)} options={['0', '50', '100']} labels={{ 0: '0%', 50: '50%', 100: '100%' }} onChange={(value) => setSettings({ ...settings, lateCancellationCharge: Number(value) })} />
+            <Toggle label="Monthly Statements" checked={settings.monthlyStatements} onChange={(checked) => setSettings({ ...settings, monthlyStatements: checked })} />
+            <Toggle label="Outstanding Reminders" checked={settings.outstandingReminders} onChange={(checked) => setSettings({ ...settings, outstandingReminders: checked })} />
+            <ReminderTemplateEditor settings={settings} setSettings={setSettings} />
+          </div>
+        </Panel>
+      </div>
+
+      {/* Sync & data */}
       <Panel>
-        <h3 className="section-title">Practice</h3>
-        <div className="mt-4 grid gap-3">
-          <Input label="Therapist Name" value={settings.therapistName} onChange={(value) => setSettings({ ...settings, therapistName: value })} />
-          <Input label="Practice Name" value={settings.practiceName} onChange={(value) => setSettings({ ...settings, practiceName: value })} />
-          <Input label="Payment Details (UPI / bank)" value={settings.paymentDetails || ''} onChange={(value) => setSettings({ ...settings, paymentDetails: value })} />
-          <Select label="Currency" value={settings.currency || 'INR'} options={CURRENCY_OPTIONS} onChange={(value) => setSettings({ ...settings, currency: value })} />
-          <Select
-            label={t('settings.language')}
-            value={settings.language || 'en'}
-            options={LANGUAGES.map(([code]) => code)}
-            labels={Object.fromEntries(LANGUAGES)}
-            onChange={(value) => setSettings({ ...settings, language: value })}
-          />
-        </div>
-        <div className="mt-5 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
-          <p className="text-sm font-semibold">Branding</p>
-          <p className="mt-1 text-sm text-[var(--subtle)]">Shown on statements and invoices you share or download.</p>
-          <div className="mt-3 grid gap-4">
-            <ImageUpload
-              label="Practice logo"
-              value={settings.logo || ''}
-              onChange={(value) => setSettings({ ...settings, logo: value })}
-              onError={onNotice}
-              maxDim={320}
-              hint="Appears at the top of each statement. PNG or JPG."
-            />
-            <ImageUpload
-              label="Signature"
-              value={settings.signatureImage || ''}
-              onChange={(value) => setSettings({ ...settings, signatureImage: value })}
-              onError={onNotice}
-              maxDim={400}
-              hint="A scan or image of your signature, shown above your name."
-            />
-            <Input
-              label="Signature name"
-              value={settings.signatureName || ''}
-              onChange={(value) => setSettings({ ...settings, signatureName: value })}
-            />
-            <p className="-mt-2 text-xs text-[var(--subtle)]">Defaults to your therapist name if left blank.</p>
+        <h3 className="section-title">Sync &amp; data</h3>
+        <p className="mt-1 text-sm text-[var(--subtle)]">
+          {drive?.signedIn ? `Signed in as ${drive.email}. ` : ''}Your data syncs to the cloud and is cached in this browser.
+        </p>
+        <div className="mt-4 grid gap-4 lg:grid-cols-2">
+          <div className="rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
+            <p className="text-sm font-semibold">Backup &amp; sample data</p>
+            <p className="mt-1 text-sm text-[var(--subtle)]">Export a JSON copy, or load sample data to explore.</p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button className="icon-button" type="button" onClick={exportJson}>
+                <Archive size={17} />
+                Backup JSON
+              </button>
+              <button className="icon-button" type="button" onClick={loadSampleData}>
+                <RefreshCcw size={17} />
+                Load sample data
+              </button>
+            </div>
+          </div>
+          <CalendarSync calendar={calendar} settings={settings} setSettings={setSettings} />
+          <BackupManager drive={drive} onNotice={onNotice} />
+          <div className="rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
+            <p className="text-sm font-semibold">Clean up duplicate charges</p>
+            <p className="mt-1 text-sm text-[var(--subtle)]">
+              Removes attendance charges left behind by the old duplicate-marking bug — charges not linked to any session. Subscription charges are never touched.
+            </p>
+            <div className="mt-3">
+              <button className="icon-button" type="button" onClick={cleanupCharges}>
+                <Trash2 size={17} />
+                Remove orphaned charges
+              </button>
+            </div>
           </div>
         </div>
-        <div className="mt-5 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
-          <p className="text-sm font-semibold">Account &amp; data</p>
-          <p className="mt-1 text-sm text-[var(--subtle)]">
-            {drive?.signedIn ? `Signed in as ${drive.email}. ` : ''}Data is stored in your own Google Drive and cached in this browser.
-          </p>
-          <div className="mt-3 flex flex-wrap gap-2">
-            <button className="icon-button" type="button" onClick={exportJson}>
-              <Archive size={17} />
-              Backup JSON
-            </button>
-            <button className="icon-button" type="button" onClick={loadSampleData}>
-              <RefreshCcw size={17} />
-              Load sample data
-            </button>
-          </div>
-        </div>
-        <BackupManager drive={drive} onNotice={onNotice} />
-        <CalendarSync calendar={calendar} settings={settings} setSettings={setSettings} />
-        <div className="mt-4 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
-          <p className="text-sm font-semibold">Clean up duplicate charges</p>
-          <p className="mt-1 text-sm text-[var(--subtle)]">
-            Removes attendance charges left behind by the old duplicate-marking bug — charges not linked to any session. Subscription charges are never touched.
-          </p>
-          <div className="mt-3">
-            <button className="icon-button" type="button" onClick={cleanupCharges}>
-              <Trash2 size={17} />
-              Remove orphaned charges
-            </button>
-          </div>
-        </div>
+      </Panel>
+
+      {/* Danger zone */}
+      <Panel>
+        <h3 className="section-title text-red-800">Danger zone</h3>
         <div className="mt-4 rounded-md border border-red-200 bg-red-50/60 p-4">
           <p className="text-sm font-semibold text-red-800">Start fresh from 1 Oct 2026</p>
           <p className="mt-1 text-sm text-[var(--subtle)]">
@@ -4701,17 +4732,6 @@ function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, sta
           )}
         </div>
       </Panel>
-      <Panel>
-        <h3 className="section-title">Billing and Reminders</h3>
-        <div className="mt-4 grid gap-4">
-          <Toggle label="Auto Create Charges" checked={settings.autoCreateCharges} onChange={(checked) => setSettings({ ...settings, autoCreateCharges: checked })} />
-          <Select label="Late Cancellation Threshold" value={String(settings.lateCancellationHours)} options={['12', '24', '48']} labels={{ 12: '12 Hours', 24: '24 Hours', 48: '48 Hours' }} onChange={(value) => setSettings({ ...settings, lateCancellationHours: Number(value) })} />
-          <Select label="Late Cancellation Charge" value={String(settings.lateCancellationCharge)} options={['0', '50', '100']} labels={{ 0: '0%', 50: '50%', 100: '100%' }} onChange={(value) => setSettings({ ...settings, lateCancellationCharge: Number(value) })} />
-          <Toggle label="Monthly Statements" checked={settings.monthlyStatements} onChange={(checked) => setSettings({ ...settings, monthlyStatements: checked })} />
-          <Toggle label="Outstanding Reminders" checked={settings.outstandingReminders} onChange={(checked) => setSettings({ ...settings, outstandingReminders: checked })} />
-          <ReminderTemplateEditor settings={settings} setSettings={setSettings} />
-        </div>
-      </Panel>
     </div>
   );
 }
@@ -4727,7 +4747,7 @@ function CalendarSync({ calendar, settings, setSettings }) {
     : 'Connected — changes sync automatically.';
 
   return (
-    <div className="mt-4 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
+    <div className="rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
       <div className="flex items-center gap-2">
         <CalendarDays size={17} className="text-[var(--primary)]" />
         <p className="text-sm font-semibold">Google Calendar</p>
@@ -4830,7 +4850,7 @@ function BackupManager({ drive, onNotice }) {
   }
 
   return (
-    <div className="mt-4 rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
+    <div className="rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
       <p className="text-sm font-semibold">Dated Drive backups</p>
       <p className="mt-1 text-sm text-[var(--subtle)]">
         {signedIn
