@@ -39,6 +39,7 @@ import { useGoogleDrive } from './googleDrive.js';
 import { useGoogleCalendar, NAMING_MODES } from './googleCalendar.js';
 import { useSupabaseAuth } from './useSupabaseAuth.js';
 import { useSupabaseData } from './useSupabaseData.js';
+import { useSupabaseCalendar } from './useSupabaseCalendar.js';
 import { LANGUAGES, setActiveLanguage, localeForLanguage, t } from './i18n.js';
 
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || '';
@@ -1408,6 +1409,15 @@ function App() {
   // fight over the same state.
   const supaData = useSupabaseData({ user: supaAuth.user, data: driveData, applyRemote });
 
+  // WS3/B: server-side calendar sync via the sync-calendar Edge Function (only in
+  // Supabase mode). Pushes sessions to the therapist's dedicated calendar.
+  const supaCalendar = useSupabaseCalendar({
+    enabled: Boolean(settings.calendar?.enabled) && supaSignedIn,
+    signedIn: supaSignedIn,
+    sessions,
+    settings,
+  });
+
   // Google Calendar sync. Merges a patch into settings.calendar (persisted and
   // Drive-synced like everything else). Functional update avoids stale closures.
   const onCalendarConfigChange = useCallback((patch) => {
@@ -2261,7 +2271,7 @@ function App() {
               />
             )}
 
-            {activeNav === 'Settings' && <SettingsScreen settings={settings} setSettings={setSettings} loadSampleData={loadSampleData} exportJson={exportJson} startFresh={startFreshFromOct1} cleanupCharges={removeOrphanedCharges} drive={drive} calendar={calendar} supaMode={supaAuth.configured} onNotice={showNotice} />}
+            {activeNav === 'Settings' && <SettingsScreen settings={settings} setSettings={setSettings} loadSampleData={loadSampleData} exportJson={exportJson} startFresh={startFreshFromOct1} cleanupCharges={removeOrphanedCharges} drive={drive} calendar={calendar} supaCalendar={supaCalendar} supaMode={supaAuth.configured} onNotice={showNotice} />}
           </div>
         </section>
       </div>
@@ -4625,7 +4635,7 @@ function ImageUpload({ label, value, onChange, hint, maxDim, onError }) {
   );
 }
 
-function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, startFresh, cleanupCharges, drive, calendar, supaMode, onNotice }) {
+function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, startFresh, cleanupCharges, drive, calendar, supaCalendar, supaMode, onNotice }) {
   const resetDone = settings.accountingStartMonth === ACCOUNTING_RESET_MONTH;
   return (
     <div className="space-y-5">
@@ -4713,7 +4723,7 @@ function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, sta
               </button>
             </div>
           </div>
-          <CalendarSync calendar={calendar} settings={settings} setSettings={setSettings} />
+          <CalendarSync calendar={calendar} supaCalendar={supaCalendar} supaMode={supaMode} settings={settings} setSettings={setSettings} />
           {!supaMode && <BackupManager drive={drive} onNotice={onNotice} />}
           <div className="rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
             <p className="text-sm font-semibold">Clean up duplicate charges</p>
@@ -4754,9 +4764,65 @@ function SettingsScreen({ settings, setSettings, loadSampleData, exportJson, sta
   );
 }
 
-function CalendarSync({ calendar, settings, setSettings }) {
+function CalendarSync({ calendar, supaCalendar, supaMode, settings, setSettings }) {
   const config = settings.calendar || {};
   const namingMode = NAMING_MODES.includes(config.namingMode) ? config.namingMode : 'initials';
+
+  // Supabase mode: sync runs server-side via the Edge Function. No GIS connect —
+  // the refresh token was captured at sign-in. Just enable it and it syncs.
+  if (supaMode) {
+    const enabled = Boolean(config.enabled);
+    const sc = supaCalendar || {};
+    const statusLabel =
+      sc.status === 'syncing' ? 'Syncing…'
+      : sc.lastSyncedAt ? `Last synced ${formatBackupTime(sc.lastSyncedAt)}`
+      : enabled ? 'On — sessions sync automatically.' : 'Off';
+    return (
+      <div className="rounded-md border border-[var(--line)] bg-[var(--bg)] p-4">
+        <div className="flex items-center gap-2">
+          <CalendarDays size={17} className="text-[var(--primary)]" />
+          <p className="text-sm font-semibold">Google Calendar</p>
+        </div>
+        <p className="mt-1 text-sm text-[var(--subtle)]">
+          Pushes your sessions to a private “QuietAdmin — Sessions” calendar in Google. The app creates and manages only
+          that calendar — it never reads your personal events.
+        </p>
+        <div className="mt-3 grid gap-3">
+          <Toggle
+            label="Sync sessions to Google Calendar"
+            checked={enabled}
+            onChange={(checked) => setSettings({ ...settings, calendar: { ...config, enabled: checked } })}
+          />
+          {enabled && (
+            <>
+              <Select
+                label="How clients appear on events"
+                value={namingMode}
+                options={NAMING_MODES}
+                labels={{ initials: 'Initials only (A.R.)', generic: 'Generic (“Session”)', name: 'Full client name' }}
+                onChange={(value) => setSettings({ ...settings, calendar: { ...config, namingMode: value } })}
+              />
+              <p className="-mt-1 text-xs text-[var(--subtle)]">Events are private. Initials or a generic label are recommended for confidentiality.</p>
+              <div className="flex flex-wrap items-center gap-2">
+                <button className="icon-button" type="button" onClick={() => sc.syncNow?.()} disabled={sc.status === 'syncing'}>
+                  <RefreshCcw size={16} />
+                  {sc.status === 'syncing' ? 'Syncing…' : 'Sync now'}
+                </button>
+                <span className="text-xs text-[var(--subtle)]">{statusLabel}</span>
+              </div>
+              {sc.lastResult && !sc.error && (
+                <p className="text-xs text-[var(--subtle)]">
+                  {(sc.lastResult.created ?? 0)} added · {(sc.lastResult.updated ?? 0)} updated · {(sc.lastResult.deleted ?? 0)} removed
+                </p>
+              )}
+              {sc.error && <p className="text-xs text-[var(--accent)]">{sc.error}</p>}
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   const busy = calendar.status === 'connecting' || calendar.status === 'syncing';
   const statusLabel =
     calendar.status === 'connecting' ? 'Connecting…'
