@@ -135,10 +135,21 @@ async function ensureCalendar(token: string, knownId: string | null): Promise<st
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
 const json = (data: unknown, status = 200) =>
-  new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
+  new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json", ...corsHeaders },
+  });
 
 Deno.serve(async (req) => {
+  // CORS preflight — the browser sends this before the real POST.
+  if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
   try {
     const authHeader = req.headers.get("Authorization") ?? "";
     const url = Deno.env.get("SUPABASE_URL")!;
