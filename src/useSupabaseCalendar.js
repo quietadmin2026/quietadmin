@@ -21,7 +21,18 @@ export function useSupabaseCalendar({ enabled, signedIn, sessions, settings }) {
     setError('');
     try {
       const { data, error: fnError } = await supabase.functions.invoke('sync-calendar');
-      if (fnError) throw fnError;
+      if (fnError) {
+        // Surface the function's own message (e.g. "google token refresh failed")
+        // instead of the generic "non-2xx status code".
+        let detail = fnError.message || 'Calendar sync failed.';
+        try {
+          const body = await fnError.context?.json?.();
+          if (body?.error) detail = body.error;
+        } catch {
+          /* keep the generic message */
+        }
+        throw new Error(detail);
+      }
       if (data?.error) throw new Error(data.error);
       setLastResult(data);
       setLastSyncedAt(Date.now());
