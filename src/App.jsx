@@ -2137,7 +2137,7 @@ function App() {
         <section className="min-w-0 flex-1">
           <MobileNav activeNav={activeNav} setActiveNav={setActiveNav} />
           <div className="mx-auto max-w-7xl px-4 py-5 sm:px-6 lg:px-8">
-            <TopBar settings={settings} drive={drive} calendar={calendar} signOut={signOut} today={today} />
+            <TopBar settings={settings} drive={drive} calendar={calendar} supaSignedIn={supaSignedIn} signOut={signOut} today={today} />
 
             {activeNav === 'Dashboard' && (
               <Dashboard
@@ -2602,7 +2602,7 @@ function Brand() {
   );
 }
 
-function TopBar({ settings, drive, calendar, signOut, today }) {
+function TopBar({ settings, drive, calendar, supaSignedIn, signOut, today }) {
   const currentDate = toDate(today).toLocaleDateString(localeForLanguage(), { weekday: 'long', month: 'long', day: 'numeric' });
   return (
     <header className="mb-5 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
@@ -2613,9 +2613,9 @@ function TopBar({ settings, drive, calendar, signOut, today }) {
       </div>
       <div className="flex flex-col items-stretch gap-2 md:items-end">
         <div className="flex flex-wrap gap-2">
-          <DriveButton drive={drive} />
+          {!supaSignedIn && <DriveButton drive={drive} />}
           {calendar?.enabled && <CalendarBadge calendar={calendar} />}
-          {drive.signedIn && (
+          {(drive.signedIn || supaSignedIn) && (
             <button className="icon-button" type="button" onClick={signOut}>
               <LogOut size={17} />
               {t('drive.signOut')}
