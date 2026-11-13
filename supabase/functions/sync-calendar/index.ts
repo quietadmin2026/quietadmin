@@ -112,7 +112,8 @@ async function gcal(token: string, path: string, init: RequestInit = {}) {
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", ...(init.headers || {}) },
   });
   if (!res.ok) {
-    const err: any = new Error(`calendar ${init.method || "GET"} ${path} failed (${res.status})`);
+    const text = await res.text().catch(() => "");
+    const err: any = new Error(`calendar ${init.method || "GET"} ${path} failed (${res.status}): ${text}`);
     err.status = res.status;
     throw err;
   }
